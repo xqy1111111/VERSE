@@ -57,3 +57,6 @@ wheelhouse/
 # Local backup snapshots
 method_tvr.bak_20260115_134311/
 .git_history_backup_*/
+
+# Project docs (keep local, do not track)
+docs/
