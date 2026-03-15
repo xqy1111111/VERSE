@@ -1,0 +1,59 @@
+# OS / editor
+.DS_Store
+*.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Python cache / build
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+
+# Virtual environments
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.cache/
+
+# Coverage
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Runtime logs / checkpoints / experiment artifacts
+*.log
+logs/
+method_tvr/results/
+method_act/results/
+outputs/
+mlruns/
+mlflow.db
+*.ckpt
+*.pth
+*.pt
+
+# Data and local downloads
+data/
+data_cache/
+wheelhouse/
+
+# Local backup snapshots
+method_tvr.bak_20260115_134311/
+.git_history_backup_*/

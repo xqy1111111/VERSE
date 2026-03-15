@@ -1,0 +1,40 @@
+[project]
+name = "acmmm2-reloclnet"
+version = "0.1.0"
+description = "Environment definition for ACMMM2 ReLoCLNet experiments"
+requires-python = ">=3.9,<3.12"
+dependencies = [
+    "easydict>=1.13,<2",
+    "h5py>=3.10,<4",
+    "numpy>=1.24,<2",
+    "tensorboard>=2.15,<3",
+    "tokenizers>=0.15.2,<0.20",
+    "tqdm>=4.66,<5",
+    "transformers>=4.38.2,<5",
+]
+
+[project.optional-dependencies]
+gpu-cu118 = [
+    "torch==2.2.2",
+    "torchvision==0.17.2",
+]
+bimamba = [
+    "mamba-ssm==2.3.0",
+]
+preprocess = [
+    "opencv-python>=4.8,<5",
+    "Pillow>=10,<12",
+    "pysrt>=1.1.2,<2",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu118" }]
+torchvision = [{ index = "pytorch-cu118" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true
