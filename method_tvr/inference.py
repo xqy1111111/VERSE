@@ -67,9 +67,11 @@ def post_processing_vcmr_nms(vcmr_res, nms_thd=0.6, max_before_nms=1000, max_aft
     """
     processed_vcmr_res = []
     for e in vcmr_res:
-        e["predictions"] = filter_vcmr_by_nms(e["predictions"], nms_threshold=nms_thd, max_before_nms=max_before_nms,
-                                              max_after_nms=max_after_nms)
-        processed_vcmr_res.append(e)
+        copied_item = dict(e)
+        copied_item["predictions"] = filter_vcmr_by_nms(
+            e["predictions"], nms_threshold=nms_thd, max_before_nms=max_before_nms, max_after_nms=max_after_nms
+        )
+        processed_vcmr_res.append(copied_item)
     return processed_vcmr_res
 
 
@@ -85,10 +87,21 @@ def post_processing_svmr_nms(svmr_res, nms_thd=0.6, max_before_nms=1000, max_aft
     """
     processed_svmr_res = []
     for e in svmr_res:
-        # the predictions are sorted inside the nms func.
-        e["predictions"] = temporal_non_maximum_suppression(e["predictions"][:max_before_nms],
-                                                            nms_threshold=nms_thd)[:max_after_nms]
-        processed_svmr_res.append(e)
+        raw_predictions = e["predictions"][:max_before_nms]
+        copied_item = dict(e)
+        if len(raw_predictions) == 0:
+            copied_item["predictions"] = []
+            processed_svmr_res.append(copied_item)
+            continue
+        # temporal_non_maximum_suppression expects [st, ed, score], while SVMR stores
+        # [video_idx, st, ed, score]. Convert in/out explicitly to preserve fields.
+        video_idx = raw_predictions[0][0]
+        temporal_predictions = [[pred[1], pred[2], pred[3]] for pred in raw_predictions]
+        temporal_after_nms = temporal_non_maximum_suppression(
+            temporal_predictions, nms_threshold=nms_thd
+        )[:max_after_nms]
+        copied_item["predictions"] = [[video_idx, pred[0], pred[1], pred[2]] for pred in temporal_after_nms]
+        processed_svmr_res.append(copied_item)
     return processed_svmr_res
 
 
@@ -96,8 +109,9 @@ def get_submission_top_n(submission, top_n=100):
     def get_prediction_top_n(list_dict_predictions, top_n_):
         top_n_res = []
         for e in list_dict_predictions:
-            e["predictions"] = e["predictions"][:top_n_]
-            top_n_res.append(e)
+            copied_item = dict(e)
+            copied_item["predictions"] = e["predictions"][:top_n_]
+            top_n_res.append(copied_item)
         return top_n_res
 
     top_n_submission = dict(video2idx=submission["video2idx"], )
@@ -254,6 +268,9 @@ def compute_query2ctx_info_svmr_only(model, eval_dataset, opt, ctx_info, max_bef
 
         if opt.debug:
             break
+    n_processed_query = len(query_metas)
+    svmr_gt_st_probs = svmr_gt_st_probs[:n_processed_query]
+    svmr_gt_ed_probs = svmr_gt_ed_probs[:n_processed_query]
     svmr_res = get_svmr_res_from_st_ed_probs(svmr_gt_st_probs, svmr_gt_ed_probs, query_metas, video2idx,
                                              clip_length=opt.clip_length, min_pred_l=opt.min_pred_l,
                                              max_pred_l=opt.max_pred_l, max_before_nms=max_before_nms)
@@ -345,6 +362,7 @@ def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=10
                                    num_workers=opt.num_workers, shuffle=False, pin_memory=opt.pin_memory)
     n_total_query = len(eval_dataset)
     bsz = opt.eval_query_bsz
+    vcmr_ctx_l = ctx_info["video_feat"].shape[1] if is_vcmr else None
 
     if is_vcmr:
         flat_st_ed_scores_sorted_indices = np.empty((n_total_query, max_before_nms), dtype=np.int32)
@@ -464,6 +482,17 @@ def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=10
             _flat_st_ed_scores_sorted_indices[:, :max_before_nms].cpu().numpy()
         if opt.debug:
             break
+    n_processed_query = len(query_metas)
+    if is_svmr:
+        svmr_gt_st_probs = svmr_gt_st_probs[:n_processed_query]
+        svmr_gt_ed_probs = svmr_gt_ed_probs[:n_processed_query]
+    if is_vr or is_vcmr:
+        sorted_q2c_indices = sorted_q2c_indices[:n_processed_query]
+        sorted_q2c_scores = sorted_q2c_scores[:n_processed_query]
+    if is_vcmr:
+        flat_st_ed_scores_sorted_indices = flat_st_ed_scores_sorted_indices[:n_processed_query]
+        flat_st_ed_sorted_scores = flat_st_ed_sorted_scores[:n_processed_query]
+    n_total_query = n_processed_query
 
     svmr_res = []
     if is_svmr:
@@ -490,7 +519,7 @@ def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=10
                 desc="[VCMR] Loop over queries to generate predictions", total=n_total_query):  # i is query_idx
             # list([video_idx(int), st(float), ed(float), score(float)])
             video_meta_indices_local, pred_st_indices, pred_ed_indices = np.unravel_index(
-                _flat_st_ed_scores_sorted_indices, shape=(max_n_videos, opt.max_ctx_l, opt.max_ctx_l))
+                _flat_st_ed_scores_sorted_indices, shape=(max_n_videos, vcmr_ctx_l, vcmr_ctx_l))
             # video_meta_indices_local refers to the indices among the top-max_n_videos
             # video_meta_indices refers to the indices in all the videos, which is the True indices
             video_meta_indices = sorted_q2c_indices[i, video_meta_indices_local]
