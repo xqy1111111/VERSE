@@ -132,6 +132,71 @@ class BaseOptions(object):
         self.parser.add_argument("--mamba_expand", type=int, default=2)
         self.parser.add_argument("--mamba_fuse_mode", type=str, default="sum", choices=["sum", "concat"])
 
+        # Semantic perturbation (default off, strict config-driven)
+        self.parser.add_argument("--semantic_enable", action="store_true",
+                                 help="Enable semantic perturbation training.")
+        self.parser.add_argument("--semantic_backend", type=str, default="none", choices=["none", "llm"],
+                                 help="Semantic backend: none|llm. No implicit fallback is allowed.")
+        self.parser.add_argument("--semantic_strict_mode", action="store_true", default=True,
+                                 help="Enable strict cache verification and fail-fast checks.")
+        self.parser.add_argument("--semantic_no_strict_mode", action="store_true",
+                                 help="Disable strict mode. Not recommended for reproducible experiments.")
+        self.parser.add_argument("--semantic_no_fallback", action="store_true", default=True,
+                                 help="Disallow any fallback path for Semantic.")
+        self.parser.add_argument("--semantic_allow_fallback", action="store_true",
+                                 help="Allow fallback behavior. Not recommended for ablations.")
+        self.parser.add_argument("--semantic_cache_path", type=str, default="",
+                                 help="Path to frozen Semantic cache jsonl file.")
+        self.parser.add_argument("--semantic_fail_on_missing_cache", action="store_true", default=True,
+                                 help="Fail when Semantic cache file is missing.")
+        self.parser.add_argument("--semantic_allow_missing_cache", action="store_true",
+                                 help="Do not fail on missing cache.")
+        self.parser.add_argument("--semantic_fail_on_invalid_cache", action="store_true", default=True,
+                                 help="Fail when Semantic cache content/metadata is invalid.")
+        self.parser.add_argument("--semantic_allow_invalid_cache", action="store_true",
+                                 help="Do not fail on invalid cache.")
+
+        self.parser.add_argument("--semantic_build_cache_only", action="store_true",
+                                 help="Only build Semantic cache and exit.")
+        self.parser.add_argument("--semantic_cache_split", type=str, default="train",
+                                 help="Split name embedded in Semantic cache metadata.")
+        self.parser.add_argument("--semantic_num_hard_neg", type=int, default=2)
+        self.parser.add_argument("--semantic_num_hard_pos", type=int, default=2)
+        self.parser.add_argument("--semantic_max_retries_same_backend", type=int, default=2)
+        self.parser.add_argument("--semantic_prompt_version", type=str, default="semantic_generator_v1")
+        self.parser.add_argument("--semantic_schema_version", type=str, default="semantic_schema_v1")
+        self.parser.add_argument("--semantic_generator_model", type=str, default="gpt-4.1-mini")
+        self.parser.add_argument("--semantic_verifier_model", type=str, default="gpt-4.1-mini")
+        self.parser.add_argument("--semantic_temperature", type=float, default=0.1)
+        self.parser.add_argument("--semantic_seed", type=int, default=2018)
+        self.parser.add_argument("--semantic_llm_api_base", type=str, default="")
+        self.parser.add_argument("--semantic_llm_api_key", type=str, default="")
+        self.parser.add_argument("--semantic_llm_transport", type=str, default="remote_api",
+                                 choices=["remote_api", "local_xgrammar"])
+        self.parser.add_argument("--semantic_llm_response_mode", type=str, default="json_schema",
+                                 choices=["json_schema", "none"])
+        self.parser.add_argument("--semantic_local_model_name_or_path", type=str, default="")
+        self.parser.add_argument("--semantic_local_device", type=str, default="auto")
+        self.parser.add_argument("--semantic_local_mask_backend", type=str, default="auto")
+        self.parser.add_argument("--semantic_local_max_new_tokens", type=int, default=256)
+
+        self.parser.add_argument("--semantic_neg_types", type=str, nargs="+",
+                                 default=["attribute_swap", "action_swap", "role_swap",
+                                          "temporal_order_flip", "count_state_swap", "object_scene_swap"])
+        self.parser.add_argument("--semantic_pos_types", type=str, nargs="+",
+                                 default=["paraphrase", "syntax_reorder", "modifier_compress", "lexical_variation"])
+        self.parser.add_argument("--semantic_severity_levels", type=int, nargs="+", default=[1, 2, 3])
+
+        self.parser.add_argument("--semantic_use_preference_loss", action="store_true",
+                                 help="Enable Semantic preference loss.")
+        self.parser.add_argument("--semantic_preference_margin", type=float, default=0.2)
+        self.parser.add_argument("--semantic_preference_weight", type=float, default=1.0)
+        self.parser.add_argument("--semantic_use_consistency_loss", action="store_true",
+                                 help="Enable Semantic consistency loss.")
+        self.parser.add_argument("--semantic_consistency_weight", type=float, default=1.0)
+        self.parser.add_argument("--semantic_text_encoder_name_or_path", type=str, default="bert-base-uncased",
+                                 help="Text encoder for perturbation query features (Semantic only).")
+
         self.parser.add_argument("--min_pred_l", type=int, default=2,
                                  help="constrain the [st, ed] with ed - st >= 2 (2 clips with length 1.5 each, 3 secs "
                                       "in total this is the min length for proposal-based backup_method)")
@@ -203,6 +268,57 @@ class BaseOptions(object):
         if opt.hard_negative_start_epoch != -1:
             if opt.hard_pool_size > opt.bsz:
                 print("[WARNING] hard_pool_size is larger than bsz")
+
+        # Normalize Semantic strict toggles.
+        if getattr(opt, "semantic_no_strict_mode", False):
+            opt.semantic_strict_mode = False
+        if getattr(opt, "semantic_allow_fallback", False):
+            opt.semantic_no_fallback = False
+        if getattr(opt, "semantic_allow_missing_cache", False):
+            opt.semantic_fail_on_missing_cache = False
+        if getattr(opt, "semantic_allow_invalid_cache", False):
+            opt.semantic_fail_on_invalid_cache = False
+
+        if opt.semantic_num_hard_neg < 0 or opt.semantic_num_hard_pos < 0:
+            raise ValueError("--semantic_num_hard_neg and --semantic_num_hard_pos must be >= 0.")
+        if opt.semantic_max_retries_same_backend < 0:
+            raise ValueError("--semantic_max_retries_same_backend must be >= 0.")
+        if opt.semantic_temperature < 0:
+            raise ValueError("--semantic_temperature must be >= 0.")
+        if opt.semantic_local_max_new_tokens <= 0:
+            raise ValueError("--semantic_local_max_new_tokens must be > 0.")
+        if any(e not in [1, 2, 3] for e in opt.semantic_severity_levels):
+            raise ValueError("--semantic_severity_levels only support 1/2/3.")
+
+        if opt.semantic_enable:
+            if opt.semantic_backend == "none":
+                raise ValueError("semantic_enable=true requires --semantic_backend=llm.")
+            if opt.semantic_backend != "llm":
+                raise ValueError("Unsupported --semantic_backend={}. Only llm is supported.".format(opt.semantic_backend))
+            if len(opt.device_ids) > 1:
+                raise ValueError("Semantic currently supports single-GPU training only. Set --device_ids to one GPU.")
+            if (not opt.semantic_build_cache_only) and (not opt.semantic_use_preference_loss and not opt.semantic_use_consistency_loss):
+                raise ValueError("semantic_enable=true requires at least one of "
+                                 "--semantic_use_preference_loss / --semantic_use_consistency_loss.")
+            if opt.semantic_num_hard_neg > 0 and len(opt.semantic_neg_types) == 0:
+                raise ValueError("--semantic_neg_types must be non-empty when --semantic_num_hard_neg > 0.")
+            if opt.semantic_num_hard_pos > 0 and len(opt.semantic_pos_types) == 0:
+                raise ValueError("--semantic_pos_types must be non-empty when --semantic_num_hard_pos > 0.")
+            if opt.semantic_no_fallback:
+                # In strict no-fallback mode, missing/invalid cache must always fail.
+                opt.semantic_fail_on_missing_cache = True
+                opt.semantic_fail_on_invalid_cache = True
+            if not opt.semantic_build_cache_only and not opt.semantic_cache_path:
+                raise ValueError("semantic_enable=true requires --semantic_cache_path for training.")
+            if opt.semantic_build_cache_only and opt.semantic_llm_transport == "local_xgrammar":
+                if not str(opt.semantic_local_model_name_or_path).strip():
+                    raise ValueError(
+                        "semantic_llm_transport=local_xgrammar requires --semantic_local_model_name_or_path."
+                    )
+        else:
+            if opt.semantic_build_cache_only:
+                raise ValueError("--semantic_build_cache_only requires --semantic_enable.")
+
         assert opt.stop_task in opt.eval_tasks_at_training
         opt.ckpt_filepath = os.path.join(opt.results_dir, self.ckpt_filename)
         opt.train_log_filepath = os.path.join(opt.results_dir, self.train_log_filename)

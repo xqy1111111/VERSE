@@ -178,6 +178,7 @@ class ReLoCLNet(nn.Module):
         match_labels,
         query_input_ids=None,
         query_attn_mask=None,
+        return_aux=False,
     ):
         _, mid_x_video_feat, x_video_feat = self.encode_context(video_feat, video_mask, return_mid_output=True)
         outputs = self.get_pred_from_raw_query(
@@ -232,7 +233,7 @@ class ReLoCLNet(nn.Module):
             loss_lm = self.compute_lm_loss(query_input_ids, query_attn_mask, fused_video_feat, video_mask)
 
         loss = loss_fcl + loss_vcl + loss_st_ed + loss_neg_ctx + loss_neg_q + self.lm_weight * loss_lm
-        return loss, {
+        loss_dict = {
             "loss_st_ed": float(loss_st_ed),
             "loss_fcl": float(loss_fcl),
             "loss_vcl": float(loss_vcl),
@@ -241,6 +242,13 @@ class ReLoCLNet(nn.Module):
             "loss_lm": float(loss_lm),
             "loss_overall": float(loss),
         }
+        if return_aux:
+            aux = {
+                "query_context_scores": query_context_scores,
+                "encoded_video_feat": x_video_feat,
+            }
+            return loss, loss_dict, aux
+        return loss, loss_dict
 
     def encode_query(self, query_feat, query_mask, return_encoded_query=False):
         encoded_query = self.encode_input(query_feat, query_mask, self.query_input_proj, self.query_encoder, self.query_pos_embed)
@@ -288,6 +296,15 @@ class ReLoCLNet(nn.Module):
         context_mask = context_mask.transpose(0, 1).unsqueeze(0)
         query_context_scores = mask_logits(query_context_scores, context_mask)
         return query_context_scores
+
+    def score_queries_to_single_context(self, query_feat, query_mask, context_feat, context_mask):
+        if context_feat.size(0) != 1:
+            raise ValueError("context_feat must have batch size 1, got {}".format(context_feat.size(0)))
+        if context_mask.size(0) != 1:
+            raise ValueError("context_mask must have batch size 1, got {}".format(context_mask.size(0)))
+        video_query = self.encode_query(query_feat, query_mask)
+        q2ctx_scores = self.get_video_level_scores(video_query, context_feat, context_mask)
+        return q2ctx_scores.squeeze(1)
 
     def get_merged_score(self, video_query, video_feat, cross=False):
         video_query = self.video_query_linear(video_query)

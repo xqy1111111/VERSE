@@ -46,6 +46,7 @@ class StartEndDataset(Dataset):
         tokenizer=None,
         lm_max_len=30,
         lm_start_token_id=None,
+        semantic_cache_lookup=None,
     ):
         self.dset_name = dset_name
         self.data_path = data_path
@@ -64,6 +65,7 @@ class StartEndDataset(Dataset):
         self.tokenizer = tokenizer
         self.lm_max_len = lm_max_len
         self.lm_start_token_id = lm_start_token_id
+        self.semantic_cache_lookup = semantic_cache_lookup
 
         self.use_video = "video" in self.ctx_mode
         self.use_tef = "tef" in self.ctx_mode
@@ -94,6 +96,13 @@ class StartEndDataset(Dataset):
             "duration": raw_data["duration"],
             "ts": raw_data["ts"],
         }
+        if self.semantic_cache_lookup is not None:
+            semantic_entry = self.semantic_cache_lookup.get_entry(meta["desc_id"])
+            if semantic_entry is not None:
+                meta["semantic"] = {
+                    "hard_negatives": semantic_entry["hard_negatives"],
+                    "hard_positives": semantic_entry["hard_positives"],
+                }
 
         model_inputs = {"query_feat": self.get_query_feat_by_desc_id(meta["desc_id"])}
 

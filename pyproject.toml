@@ -26,6 +26,9 @@ preprocess = [
     "Pillow>=10,<12",
     "pysrt>=1.1.2,<2",
 ]
+semantic-local = [
+    "xgrammar>=0.1.25",
+]
 
 [tool.uv]
 package = false

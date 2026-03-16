@@ -14,11 +14,13 @@ import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from method_tvr.config import BaseOptions
+from method_tvr.semantic_perturb.cache_builder import SemanticBuildConfig, build_semantic_cache
+from method_tvr.semantic_perturb.dataset_semantic import SemanticLossRuntime, load_semantic_cache_lookup
 from method_tvr.model import ReLoCLNet
 from method_tvr.start_end_dataset import StartEndDataset, start_end_collate, StartEndEvalDataset, prepare_batch_inputs
 from method_tvr.inference import eval_epoch, start_inference
 from method_tvr.optimization import BertAdam
-from utils.basic_utils import AverageMeter
+from utils.basic_utils import AverageMeter, save_json
 from utils.model_utils import count_parameters
 
 
@@ -36,7 +38,80 @@ def set_seed(seed, use_cuda=True):
         torch.cuda.manual_seed_all(seed)
 
 
-def train_epoch(model, train_loader, optimizer, opt, epoch_i, training=True):
+def _extract_semantic_opt_dict(opt):
+    keys = [
+        "semantic_enable",
+        "semantic_backend",
+        "semantic_strict_mode",
+        "semantic_no_fallback",
+        "semantic_cache_path",
+        "semantic_fail_on_missing_cache",
+        "semantic_fail_on_invalid_cache",
+        "semantic_cache_split",
+        "semantic_num_hard_neg",
+        "semantic_num_hard_pos",
+        "semantic_max_retries_same_backend",
+        "semantic_prompt_version",
+        "semantic_schema_version",
+        "semantic_generator_model",
+        "semantic_verifier_model",
+        "semantic_temperature",
+        "semantic_seed",
+        "semantic_llm_api_base",
+        "semantic_llm_api_key",
+        "semantic_llm_transport",
+        "semantic_llm_response_mode",
+        "semantic_local_model_name_or_path",
+        "semantic_local_device",
+        "semantic_local_mask_backend",
+        "semantic_local_max_new_tokens",
+        "semantic_neg_types",
+        "semantic_pos_types",
+        "semantic_severity_levels",
+        "semantic_use_preference_loss",
+        "semantic_preference_margin",
+        "semantic_preference_weight",
+        "semantic_use_consistency_loss",
+        "semantic_consistency_weight",
+        "semantic_text_encoder_name_or_path",
+    ]
+    return {k: getattr(opt, k) for k in keys}
+
+
+def _build_semantic_cache_from_opt(opt):
+    cfg = SemanticBuildConfig(
+        dset_name=opt.dset_name,
+        source_path=opt.train_path,
+        cache_split=opt.semantic_cache_split,
+        output_path=opt.semantic_cache_path,
+        backend=opt.semantic_backend,
+        strict_mode=opt.semantic_strict_mode,
+        no_fallback=opt.semantic_no_fallback,
+        num_hard_neg=opt.semantic_num_hard_neg,
+        num_hard_pos=opt.semantic_num_hard_pos,
+        max_retries_same_backend=opt.semantic_max_retries_same_backend,
+        prompt_version=opt.semantic_prompt_version,
+        schema_version=opt.semantic_schema_version,
+        generator_model=opt.semantic_generator_model,
+        verifier_model=opt.semantic_verifier_model,
+        temperature=opt.semantic_temperature,
+        seed=opt.semantic_seed,
+        neg_types=opt.semantic_neg_types,
+        pos_types=opt.semantic_pos_types,
+        severity_levels=opt.semantic_severity_levels,
+        llm_api_base=opt.semantic_llm_api_base,
+        llm_api_key=opt.semantic_llm_api_key,
+        llm_transport=opt.semantic_llm_transport,
+        llm_response_mode=opt.semantic_llm_response_mode,
+        local_model_name_or_path=opt.semantic_local_model_name_or_path,
+        local_device=opt.semantic_local_device,
+        local_mask_backend=opt.semantic_local_mask_backend,
+        local_max_new_tokens=opt.semantic_local_max_new_tokens,
+    )
+    return build_semantic_cache(cfg)
+
+
+def train_epoch(model, train_loader, optimizer, opt, epoch_i, training=True, semantic_runtime=None):
     logger.info("use train_epoch func for training: {}".format(training))
     model.train(mode=training)
     if opt.hard_negative_start_epoch != -1 and epoch_i >= opt.hard_negative_start_epoch:
@@ -52,6 +127,10 @@ def train_epoch(model, train_loader, optimizer, opt, epoch_i, training=True):
     loss_meters = OrderedDict(loss_st_ed=AverageMeter(), loss_fcl=AverageMeter(), loss_vcl=AverageMeter(),
                               loss_neg_ctx=AverageMeter(), loss_neg_q=AverageMeter(), loss_lm=AverageMeter(),
                               loss_overall=AverageMeter())
+    if getattr(opt, "semantic_enable", False):
+        loss_meters["loss_semantic_pref"] = AverageMeter()
+        loss_meters["loss_semantic_cons"] = AverageMeter()
+        loss_meters["loss_semantic_total"] = AverageMeter()
 
     num_training_examples = len(train_loader)
     timer_dataloading = time.time()
@@ -60,11 +139,29 @@ def train_epoch(model, train_loader, optimizer, opt, epoch_i, training=True):
         dataloading_time.update(time.time() - timer_dataloading)
 
         # continue
+        use_semantic = bool(getattr(opt, "semantic_enable", False) and training and semantic_runtime is not None)
         timer_start = time.time()
+        batch_meta = batch[0]
         model_inputs = prepare_batch_inputs(batch[1], opt.device, non_blocking=opt.pin_memory)
         prepare_inputs_time.update(time.time() - timer_start)
         timer_start = time.time()
-        loss, loss_dict = model(**model_inputs)
+        model_aux = None
+        if use_semantic:
+            loss, loss_dict, model_aux = model(**model_inputs, return_aux=True)
+        else:
+            loss, loss_dict = model(**model_inputs)
+
+        if use_semantic:
+            model_core = model.module if isinstance(model, torch.nn.DataParallel) else model
+            loss_semantic, loss_semantic_dict = semantic_runtime.compute_losses(
+                model_core=model_core,
+                model_inputs=model_inputs,
+                batch_meta=batch_meta,
+                model_aux=model_aux,
+            )
+            loss = loss + loss_semantic
+            loss_dict.update(loss_semantic_dict)
+            loss_dict["loss_overall"] = float(loss.detach().cpu().item())
         model_forward_time.update(time.time() - timer_start)
         timer_start = time.time()
         if training:
@@ -80,6 +177,8 @@ def train_epoch(model, train_loader, optimizer, opt, epoch_i, training=True):
                 opt.writer.add_scalar("Train/{}".format(k), v, global_step)
 
         for k, v in loss_dict.items():
+            if k not in loss_meters:
+                loss_meters[k] = AverageMeter()
             loss_meters[k].update(float(v))
 
         timer_dataloading = time.time()
@@ -112,7 +211,7 @@ def rm_key_from_odict(odict_obj, rm_suffix):
     return OrderedDict([(k, v) for k, v in odict_obj.items() if rm_suffix not in k])
 
 
-def train(model, train_dataset, train_eval_dataset, val_dataset, opt):
+def train(model, train_dataset, train_eval_dataset, val_dataset, opt, semantic_runtime=None):
     # Prepare optimizer
     if opt.device.type == "cuda":
         logger.info("CUDA enabled.")
@@ -123,8 +222,10 @@ def train(model, train_dataset, train_eval_dataset, val_dataset, opt):
 
     train_loader = DataLoader(train_dataset, collate_fn=start_end_collate, batch_size=opt.bsz,
                               num_workers=opt.num_workers, shuffle=True, pin_memory=opt.pin_memory)
-    train_eval_loader = DataLoader(train_eval_dataset, collate_fn=start_end_collate, batch_size=opt.bsz,
-                                   num_workers=opt.num_workers, shuffle=False, pin_memory=opt.pin_memory)
+    train_eval_loader = None
+    if train_eval_dataset is not None:
+        train_eval_loader = DataLoader(train_eval_dataset, collate_fn=start_end_collate, batch_size=opt.bsz,
+                                       num_workers=opt.num_workers, shuffle=False, pin_memory=opt.pin_memory)
     # Prepare optimizer
     param_optimizer = list(model.named_parameters())
     no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
@@ -144,11 +245,11 @@ def train(model, train_dataset, train_eval_dataset, val_dataset, opt):
     for epoch_i in trange(start_epoch, opt.n_epoch, desc="Epoch"):
         if epoch_i > -1:
             with torch.autograd.detect_anomaly():
-                train_epoch(model, train_loader, optimizer, opt, epoch_i, training=True)
+                train_epoch(model, train_loader, optimizer, opt, epoch_i, training=True, semantic_runtime=semantic_runtime)
         global_step = (epoch_i + 1) * len(train_loader)
-        if opt.eval_path is not None:
+        if opt.eval_path is not None and train_eval_loader is not None:
             with torch.no_grad():
-                train_epoch(model, train_eval_loader, optimizer, opt, epoch_i, training=False)
+                train_epoch(model, train_eval_loader, optimizer, opt, epoch_i, training=False, semantic_runtime=semantic_runtime)
                 metrics_no_nms, metrics_nms, latest_file_paths = eval_epoch(
                     model, val_dataset, opt, save_submission_filename, tasks=eval_tasks_at_training, max_after_nms=100)
             to_write = opt.eval_log_txt_formatter.format(time_str=time.strftime("%Y_%m_%d_%H_%M_%S"), epoch=epoch_i,
@@ -213,6 +314,20 @@ def start_training():
         cudnn.benchmark = False
         cudnn.deterministic = True
 
+    if getattr(opt, "semantic_build_cache_only", False):
+        out_paths = _build_semantic_cache_from_opt(opt)
+        save_json(
+            {
+                "semantic_config": _extract_semantic_opt_dict(opt),
+                "outputs": out_paths,
+            },
+            os.path.join(opt.results_dir, "semantic_cache_build_outputs.json"),
+            save_pretty=True,
+            sort_keys=True,
+        )
+        logger.info("Semantic cache build-only completed: {}".format(out_paths))
+        return opt.results_dir, opt.eval_split_name, opt.eval_path, opt.debug, True
+
     opt.writer = SummaryWriter(opt.tensorboard_log_dir)
     opt.train_log_txt_formatter = "{time_str} [Epoch] {epoch:03d} [Loss] {loss_str}\n"
     opt.eval_log_txt_formatter = "{time_str} [Epoch] {epoch:03d} [Metrics] {eval_metrics_str}\n"
@@ -235,6 +350,18 @@ def start_training():
             if opt.lm_pad_token_id is None:
                 opt.lm_pad_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
 
+    semantic_cache_lookup = None
+    semantic_runtime = None
+    if getattr(opt, "semantic_enable", False):
+        semantic_cache_lookup = load_semantic_cache_lookup(opt, source_data_path=opt.train_path)
+        semantic_runtime = SemanticLossRuntime(opt)
+        semantic_summary = {
+            "semantic_config": _extract_semantic_opt_dict(opt),
+            "cache_manifest": semantic_cache_lookup.manifest if semantic_cache_lookup is not None else None,
+            "cache_path": opt.semantic_cache_path,
+        }
+        save_json(semantic_summary, os.path.join(opt.results_dir, "semantic_summary.json"), save_pretty=True, sort_keys=True)
+
     train_dataset = StartEndDataset(
         dset_name=opt.dset_name,
         data_path=opt.train_path,
@@ -250,7 +377,8 @@ def start_training():
         normalize_tfeat=not opt.no_norm_tfeat,
         tokenizer=tokenizer,
         lm_max_len=opt.lm_max_len,
-        lm_start_token_id=opt.lm_start_token_id)
+        lm_start_token_id=opt.lm_start_token_id,
+        semantic_cache_lookup=semantic_cache_lookup)
 
     if opt.eval_path is not None:
         # val dataset, used to get eval loss
@@ -328,13 +456,13 @@ def start_training():
     model = ReLoCLNet(model_config)
     count_parameters(model)
     logger.info("Start Training...")
-    train(model, train_dataset, train_eval_dataset, eval_dataset, opt)
-    return opt.results_dir, opt.eval_split_name, opt.eval_path, opt.debug
+    train(model, train_dataset, train_eval_dataset, eval_dataset, opt, semantic_runtime=semantic_runtime)
+    return opt.results_dir, opt.eval_split_name, opt.eval_path, opt.debug, False
 
 
 if __name__ == '__main__':
-    model_dir, eval_split_name, eval_path, debug = start_training()
-    if not debug:
+    model_dir, eval_split_name, eval_path, debug, build_only = start_training()
+    if not debug and not build_only:
         model_dir = model_dir.split(os.sep)[-1]
         tasks = ["SVMR", "VCMR", "VR"]
         input_args = ["--model_dir", model_dir, "--nms_thd", "0.5", "--eval_split_name", eval_split_name,
