@@ -44,6 +44,8 @@ def _parser() -> argparse.ArgumentParser:
     build.add_argument("--progress_every", type=int, default=None)
     build.add_argument("--slow_record_warn_s", type=float, default=None)
     build.add_argument("--build_workers", type=int, default=None)
+    build.add_argument("--progress_style", type=str, default="", choices=["line", "bar"])
+    build.add_argument("--resume", action="store_true", default=None)
 
     return parser
 
@@ -97,6 +99,8 @@ def _build_config_from_args(args) -> SemanticBuildConfig:
     _maybe_set(kwargs, "progress_every", args.progress_every)
     _maybe_set(kwargs, "slow_record_warn_s", args.slow_record_warn_s)
     _maybe_set(kwargs, "build_workers", args.build_workers)
+    _maybe_set(kwargs, "progress_style", args.progress_style)
+    _maybe_set(kwargs, "resume", args.resume)
 
     if args.neg_types:
         kwargs["neg_types"] = list(args.neg_types)

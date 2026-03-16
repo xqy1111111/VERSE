@@ -43,6 +43,7 @@ logs/
 method_tvr/results/
 method_act/results/
 outputs/
+cache/
 mlruns/
 mlflow.db
 *.ckpt

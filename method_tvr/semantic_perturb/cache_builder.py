@@ -54,6 +54,8 @@ class SemanticBuildConfig:
     progress_every: int = 20
     slow_record_warn_s: float = 45.0
     build_workers: int = 1
+    progress_style: str = "line"
+    resume: bool = False
 
 
 class BuildFailure(Exception):
@@ -69,6 +71,104 @@ class FatalBuildError(Exception):
 def _log(message: str) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print("[{}] [semantic-cache] {}".format(ts, message), flush=True)
+
+
+def _format_progress_message(
+    *,
+    idx: int,
+    total: int,
+    ok: int,
+    fail: int,
+    speed: float,
+    eta_s: float,
+    style: str,
+) -> str:
+    pct = 100.0 * idx / max(total, 1)
+    if style == "bar":
+        width = 24
+        filled = int(width * pct / 100.0)
+        filled = max(0, min(width, filled))
+        bar = "#" * filled + "-" * (width - filled)
+        return (
+            "progress: [{}] {}/{} ({:.1f}%) ok={} fail={} speed={:.2f} rec/s eta={:.1f}m".format(
+                bar,
+                idx,
+                total,
+                pct,
+                ok,
+                fail,
+                speed,
+                eta_s / 60.0,
+            )
+        )
+    return "progress: {}/{} ({:.1f}%) ok={} fail={} speed={:.2f} rec/s eta={:.1f}m".format(
+        idx,
+        total,
+        pct,
+        ok,
+        fail,
+        speed,
+        eta_s / 60.0,
+    )
+
+
+def _load_existing_cache_records(cache_jsonl_path: str) -> List[Dict]:
+    if not os.path.exists(cache_jsonl_path):
+        return []
+    records: List[Dict] = []
+    with open(cache_jsonl_path, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except Exception as err:  # noqa: PERF203
+                raise RuntimeError(
+                    "Existing cache file has invalid JSON at line {}: {}".format(line_no, err)
+                ) from err
+            if not isinstance(item, dict):
+                raise RuntimeError("Existing cache line {} must be JSON object".format(line_no))
+            if "desc_id" not in item:
+                raise RuntimeError("Existing cache line {} missing desc_id".format(line_no))
+            records.append(item)
+    return records
+
+
+def _validate_resume_manifest_if_present(cfg: SemanticBuildConfig, manifest_path: str, source_hash: str) -> None:
+    if not os.path.exists(manifest_path):
+        _log("resume: manifest not found at {}, skip manifest-compat check".format(manifest_path))
+        return
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        prev = json.load(f)
+    expected = {
+        "dataset": cfg.dset_name,
+        "split": cfg.cache_split,
+        "source_hash": source_hash,
+        "prompt_version": cfg.prompt_version,
+        "schema_version": cfg.schema_version,
+        "generator_model": cfg.generator_model,
+        "verifier_model": cfg.verifier_model,
+        "backend": cfg.backend,
+        "llm_transport": cfg.llm_transport,
+        "llm_response_mode": cfg.llm_response_mode,
+        "num_hard_neg": cfg.num_hard_neg,
+        "num_hard_pos": cfg.num_hard_pos,
+        "neg_types": sorted(cfg.neg_types),
+        "pos_types": sorted(cfg.pos_types),
+        "severity_levels": sorted(int(x) for x in cfg.severity_levels),
+        "no_fallback": bool(cfg.no_fallback),
+        "strict_mode": bool(cfg.strict_mode),
+    }
+    mismatches: List[str] = []
+    for key, exp in expected.items():
+        got = prev.get(key)
+        if got != exp:
+            mismatches.append("{}: expected={}, got={}".format(key, exp, got))
+    if mismatches:
+        raise RuntimeError(
+            "Resume rejected due to manifest mismatch: {}".format("; ".join(mismatches))
+        )
 
 
 def _normalize_source_record(raw_data: Dict) -> Dict:
@@ -142,6 +242,8 @@ def _validate_build_config(cfg: SemanticBuildConfig) -> None:
         raise ValueError("progress_every must be positive")
     if int(cfg.build_workers) <= 0:
         raise ValueError("build_workers must be positive")
+    if cfg.progress_style not in {"line", "bar"}:
+        raise ValueError("progress_style must be one of: line, bar")
     if float(cfg.slow_record_warn_s) < 0:
         raise ValueError("slow_record_warn_s must be >= 0")
     if cfg.llm_transport == "local_xgrammar" and int(cfg.build_workers) > 1:
@@ -182,6 +284,7 @@ def _build_manifest(cfg: SemanticBuildConfig, source_hash: str, source_path: str
         "local_max_new_tokens": int(cfg.local_max_new_tokens),
         "progress_every": int(cfg.progress_every),
         "build_workers": int(cfg.build_workers),
+        "progress_style": cfg.progress_style,
         "slow_record_warn_s": float(cfg.slow_record_warn_s),
         "seed": cfg.seed,
         "timestamp": utc_timestamp(),
@@ -378,14 +481,14 @@ def _consume_record_result(
         remaining = total - idx
         eta_s = (remaining / speed) if speed > 0 else 0.0
         _log(
-            "progress: {}/{} ({:.1f}%) ok={} fail={} speed={:.2f} rec/s eta={:.1f}m".format(
-                idx,
-                total,
-                100.0 * idx / max(total, 1),
-                len(cache_records),
-                len(failures),
-                speed,
-                eta_s / 60.0,
+            _format_progress_message(
+                idx=idx,
+                total=total,
+                ok=len(cache_records),
+                fail=len(failures),
+                speed=speed,
+                eta_s=eta_s,
+                style=cfg.progress_style,
             )
         )
 
@@ -402,46 +505,115 @@ def build_semantic_cache(cfg: SemanticBuildConfig) -> Dict[str, str]:
     out_dir = os.path.dirname(out_paths["cache_jsonl"]) or "."
     os.makedirs(out_dir, exist_ok=True)
 
-    backend = build_semantic_backend(
-        transport=cfg.llm_transport,
-        api_base=cfg.llm_api_base or None,
-        api_key=cfg.llm_api_key or None,
-        response_mode=cfg.llm_response_mode,
-        local_model_name_or_path=cfg.local_model_name_or_path,
-        local_device=cfg.local_device,
-        local_mask_backend=cfg.local_mask_backend,
-        local_max_new_tokens=cfg.local_max_new_tokens,
-    )
-    generator = SemanticGenerator(
-        backend=backend,
-        model_name=cfg.generator_model,
-        temperature=cfg.temperature,
-        neg_types=cfg.neg_types,
-        pos_types=cfg.pos_types,
-        severity_levels=cfg.severity_levels,
-        num_hard_neg=cfg.num_hard_neg,
-        num_hard_pos=cfg.num_hard_pos,
-    )
-    verifier = SemanticVerifier(backend=backend, model_name=cfg.verifier_model, temperature=cfg.temperature)
+    source_idx_by_desc_id: Dict[int, int] = {}
+    for idx, record in enumerate(records, start=1):
+        desc_id = int(record["desc_id"])
+        if desc_id in source_idx_by_desc_id:
+            raise RuntimeError("source_path has duplicated desc_id: {}".format(desc_id))
+        source_idx_by_desc_id[desc_id] = idx
 
     cache_records: List[Dict] = []
     failures: List[Dict] = []
+    completed_desc_ids = set()
+
+    if cfg.resume:
+        existing_records = _load_existing_cache_records(out_paths["cache_jsonl"])
+        if existing_records:
+            _validate_resume_manifest_if_present(cfg, out_paths["manifest_json"], source_hash)
+            existing_indices: List[int] = []
+            existing_desc_ids: List[int] = []
+            for item in existing_records:
+                desc_id = int(item["desc_id"])
+                if desc_id in completed_desc_ids:
+                    raise RuntimeError("Existing cache has duplicated desc_id: {}".format(desc_id))
+                src_idx = source_idx_by_desc_id.get(desc_id)
+                if src_idx is None:
+                    raise RuntimeError("Existing cache has desc_id not in source annotations: {}".format(desc_id))
+                completed_desc_ids.add(desc_id)
+                existing_indices.append(src_idx)
+                existing_desc_ids.append(desc_id)
+
+            expected_indices = list(range(1, len(existing_indices) + 1))
+            if existing_indices != expected_indices:
+                raise RuntimeError(
+                    "Resume requires existing cache to be a source-order prefix; got indices head={} tail={}".format(
+                        existing_indices[:5],
+                        existing_indices[-5:] if existing_indices else [],
+                    )
+                )
+
+            cache_records.extend(existing_records)
+            _log(
+                "resume: loaded {} existing records from {}".format(
+                    len(existing_records),
+                    out_paths["cache_jsonl"],
+                )
+            )
+
+    records_to_build = [
+        (idx, record)
+        for idx, record in enumerate(records, start=1)
+        if int(record["desc_id"]) not in completed_desc_ids
+    ]
+
     start_ts = time.perf_counter()
     _log(
-        "start: dataset={} split={} total={} transport={} response_mode={} workers={} output={}".format(
+        "start: dataset={} split={} total={} pending={} resumed={} transport={} response_mode={} workers={} progress_style={} output={}".format(
             cfg.dset_name,
             cfg.cache_split,
             total,
+            len(records_to_build),
+            len(cache_records),
             cfg.llm_transport,
             cfg.llm_response_mode,
             int(cfg.build_workers),
+            cfg.progress_style,
             out_paths["cache_jsonl"],
         )
     )
 
-    with open(out_paths["cache_jsonl"], "w", encoding="utf-8") as cache_f:
-        if int(cfg.build_workers) == 1:
-            for idx, record in enumerate(records, start=1):
+    if completed_desc_ids:
+        _log(
+            _format_progress_message(
+                idx=len(completed_desc_ids),
+                total=total,
+                ok=len(cache_records),
+                fail=len(failures),
+                speed=0.0,
+                eta_s=0.0,
+                style=cfg.progress_style,
+            )
+        )
+
+    if records_to_build:
+        backend = build_semantic_backend(
+            transport=cfg.llm_transport,
+            api_base=cfg.llm_api_base or None,
+            api_key=cfg.llm_api_key or None,
+            response_mode=cfg.llm_response_mode,
+            local_model_name_or_path=cfg.local_model_name_or_path,
+            local_device=cfg.local_device,
+            local_mask_backend=cfg.local_mask_backend,
+            local_max_new_tokens=cfg.local_max_new_tokens,
+        )
+        generator = SemanticGenerator(
+            backend=backend,
+            model_name=cfg.generator_model,
+            temperature=cfg.temperature,
+            neg_types=cfg.neg_types,
+            pos_types=cfg.pos_types,
+            severity_levels=cfg.severity_levels,
+            num_hard_neg=cfg.num_hard_neg,
+            num_hard_pos=cfg.num_hard_pos,
+        )
+        verifier = SemanticVerifier(backend=backend, model_name=cfg.verifier_model, temperature=cfg.temperature)
+
+    open_mode = "a" if cfg.resume and cache_records else "w"
+    with open(out_paths["cache_jsonl"], open_mode, encoding="utf-8") as cache_f:
+        if not records_to_build:
+            _log("resume: nothing to build, cache already complete")
+        elif int(cfg.build_workers) == 1:
+            for idx, record in records_to_build:
                 result = _build_one_record_result(
                     idx=idx,
                     record=record,
@@ -461,7 +633,7 @@ def build_semantic_cache(cfg: SemanticBuildConfig) -> Dict[str, str]:
                 )
         else:
             ordered_results: Dict[int, Dict] = {}
-            next_idx = 1
+            next_idx = records_to_build[0][0]
             with ThreadPoolExecutor(max_workers=int(cfg.build_workers)) as executor:
                 future_to_idx = {
                     executor.submit(
@@ -473,7 +645,7 @@ def build_semantic_cache(cfg: SemanticBuildConfig) -> Dict[str, str]:
                         cfg=cfg,
                         manifest=manifest,
                     ): idx
-                    for idx, record in enumerate(records, start=1)
+                    for idx, record in records_to_build
                 }
                 try:
                     for future in as_completed(future_to_idx):
