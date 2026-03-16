@@ -239,7 +239,6 @@ def start_training():
         dset_name=opt.dset_name,
         data_path=opt.train_path,
         desc_bert_path_or_handler=opt.desc_bert_path,
-        sub_bert_path_or_handler=opt.sub_bert_path,
         max_desc_len=opt.max_desc_l,
         max_ctx_len=opt.max_ctx_l,
         vid_feat_path_or_handler=opt.vid_feat_path,
@@ -259,7 +258,6 @@ def start_training():
             dset_name=opt.dset_name,
             data_path=opt.eval_path,
             desc_bert_path_or_handler=train_dataset.desc_bert_h5,
-            sub_bert_path_or_handler=train_dataset.sub_bert_h5 if "sub" in opt.ctx_mode else None,
             max_desc_len=opt.max_desc_l,
             max_ctx_len=opt.max_ctx_l,
             vid_feat_path_or_handler=train_dataset.vid_feat_h5 if "video" in opt.ctx_mode else None,
@@ -278,7 +276,6 @@ def start_training():
             eval_split_name=opt.eval_split_name,  # should only be val set
             data_path=opt.eval_path,
             desc_bert_path_or_handler=train_dataset.desc_bert_h5,
-            sub_bert_path_or_handler=train_dataset.sub_bert_h5 if "sub" in opt.ctx_mode else None,
             max_desc_len=opt.max_desc_l,
             max_ctx_len=opt.max_ctx_l,
             video_duration_idx_path=opt.video_duration_idx_path,
@@ -295,8 +292,7 @@ def start_training():
 
     model_config = EDict(
         visual_input_size=opt.vid_feat_size,
-        sub_input_size=opt.sub_feat_size,  # for both desc and subtitles
-        query_input_size=opt.q_feat_size,  # for both desc and subtitles
+        query_input_size=opt.q_feat_size,
         hidden_size=opt.hidden_size,  # hidden dimension
         conv_kernel_size=opt.conv_kernel_size,
         conv_stride=opt.conv_stride,
@@ -306,7 +302,7 @@ def start_training():
         drop=opt.drop,
         n_heads=opt.n_heads,  # self-att heads
         initializer_range=opt.initializer_range,  # for linear layer
-        ctx_mode=opt.ctx_mode,  # video, sub or video_sub
+        ctx_mode=opt.ctx_mode,
         backbone_type=opt.backbone_type,
         use_generative_augmentation=opt.use_generative_augmentation,
         use_fusion_encoder=opt.use_fusion_encoder,

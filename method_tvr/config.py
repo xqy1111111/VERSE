@@ -40,7 +40,7 @@ class BaseOptions(object):
         self.parser.add_argument("--no_core_driver", action="store_true",
                                  help="hdf5 driver, default use `core` (load into RAM), if specified, use `None`")
         self.parser.add_argument("--no_pin_memory", action="store_true", help="No use pin_memory=True for dataloader")
-        # training config
+
         self.parser.add_argument("--lr", type=float, default=1e-4, help="learning rate")
         self.parser.add_argument("--lr_warmup_proportion", type=float, default=0.01,
                                  help="Proportion of training to perform linear learning rate warmup.")
@@ -55,7 +55,7 @@ class BaseOptions(object):
         self.parser.add_argument("--bsz", type=int, default=128, help="mini-batch size")
         self.parser.add_argument("--eval_query_bsz", type=int, default=50, help="minibatch size at inference for query")
         self.parser.add_argument("--eval_context_bsz", type=int, default=200,
-                                 help="mini-batch size at inference, for video/sub")
+                                 help="mini-batch size at inference for context videos")
         self.parser.add_argument("--eval_untrained", action="store_true", help="Evaluate on un-trained model")
         self.parser.add_argument("--grad_clip", type=float, default=-1, help="perform gradient clip, -1: disable")
         self.parser.add_argument("--margin", type=float, default=0.1, help="margin for hinge loss")
@@ -75,9 +75,7 @@ class BaseOptions(object):
                                       "use -1 to disable")
         self.parser.add_argument("--hard_pool_size", type=int, default=20,
                                  help="hard negatives are still sampled, but from a harder pool.")
-        # Model and Data config
-        self.parser.add_argument("--max_sub_l", type=int, default=50,
-                                 help="max length of all sub sentence 97.71 under 50 for 3 sentences")
+
         self.parser.add_argument("--max_desc_l", type=int, default=30, help="max length of descriptions")
         self.parser.add_argument("--max_ctx_l", type=int, default=128,
                                  help="max number of snippets, 100 for tvr clip_length=1.5, oly 109/21825 > 100")
@@ -86,9 +84,7 @@ class BaseOptions(object):
                                  help="Evaluating during training, for Dev set. If None, will only do training, "
                                       "anet_cap and charades_sta has no dev set, so None")
         self.parser.add_argument("--desc_bert_path", type=str, default=None)
-        self.parser.add_argument("--sub_bert_path", type=str, default=None)
-        self.parser.add_argument("--sub_feat_size", type=int, default=768, help="feature dim for sub feature")
-        self.parser.add_argument("--q_feat_size", type=int, default=768, help="feature dim for sub feature")
+        self.parser.add_argument("--q_feat_size", type=int, default=768, help="feature dim for query feature")
         self.parser.add_argument("--ctx_mode", type=str, help="which context to use a combination of [video, tef]",
                                  choices=["video", "tef", "video_tef"])
         self.parser.add_argument("--video_duration_idx_path", type=str, default=None)
@@ -108,14 +104,14 @@ class BaseOptions(object):
         self.parser.add_argument("--conv_kernel_size", type=int, default=5)
         self.parser.add_argument("--conv_stride", type=int, default=1)
         self.parser.add_argument("--initializer_range", type=float, default=0.02, help="initializer range for layers")
-        # backbone selection
+
         self.parser.add_argument("--backbone_type", type=str, default="Transformer",
                                  choices=["Transformer", "BiMamba"])
-        # generative augmentation
+
         self.parser.add_argument("--use_generative_augmentation", action="store_true",
                                  help="Enable decoder LM loss during training")
         self.parser.add_argument("--use_fusion_encoder", action="store_true",
-                                 help="Enable query-video fusion encoder (GAR/TFVTG)")
+                                 help="Enable query-video fusion encoder")
         self.parser.add_argument("--fusion_num_layers", type=int, default=2,
                                  help="number of fusion encoder layers")
         self.parser.add_argument("--lm_weight", type=float, default=0.3, help="weight for LM loss")
@@ -130,12 +126,12 @@ class BaseOptions(object):
         self.parser.add_argument("--lm_vocab_size", type=int, default=None, help="override tokenizer vocab size")
         self.parser.add_argument("--lm_pad_token_id", type=int, default=None, help="override tokenizer pad id")
         self.parser.add_argument("--lm_num_layers", type=int, default=2, help="decoder layers for LM loss")
-        # mamba params
+
         self.parser.add_argument("--mamba_d_state", type=int, default=16)
         self.parser.add_argument("--mamba_d_conv", type=int, default=4)
         self.parser.add_argument("--mamba_expand", type=int, default=2)
         self.parser.add_argument("--mamba_fuse_mode", type=str, default="sum", choices=["sum", "concat"])
-        # post processing
+
         self.parser.add_argument("--min_pred_l", type=int, default=2,
                                  help="constrain the [st, ed] with ed - st >= 2 (2 clips with length 1.5 each, 3 secs "
                                       "in total this is the min length for proposal-based backup_method)")
@@ -146,41 +142,21 @@ class BaseOptions(object):
                                  help="give more importance to top scored videos' spans,  "
                                       "the new score will be: s_new = exp(alpha * s), "
                                       "higher alpha indicates more importance. Note s in [-1, 1]")
-        self.parser.add_argument("--score_theta", type=float, default=None,
-                                 help="geometric fusion weight for final VCMR score; "
-                                      "None keeps legacy product, 0..1 uses Eq.(15)")
         self.parser.add_argument("--max_before_nms", type=int, default=200)
         self.parser.add_argument("--max_vcmr_video", type=int, default=100, help="re-ranking in top-max_vcmr_video")
         self.parser.add_argument("--nms_thd", type=float, default=-1,
                                  help="additionally use non-maximum suppression (or non-minimum suppression for "
                                       "distance) to post-processing the predictions. -1: do not use nms. 0.6 for "
                                       "charades_sta, 0.5 for anet_cap")
-        # TFVTG scoring parameters
-        self.parser.add_argument("--scoring_method", type=str, default="Baseline",
-                                 choices=["Baseline", "TFVTG"],
-                                 help="Scoring method for moment retrieval. Baseline: use model output directly; "
-                                      "TFVTG: use temporal fine-grained video-text grounding scoring")
-        self.parser.add_argument("--tfvtg_stride", type=int, default=2,
-                                 help="stride for TFVTG scoring")
-        self.parser.add_argument("--tfvtg_max_stride", type=int, default=16,
-                                 help="max stride for TFVTG scoring")
-        self.parser.add_argument("--tfvtg_dynamic_weight", type=float, default=0.5,
-                                 help="weight for dynamic scoring in TFVTG")
-        self.parser.add_argument("--tfvtg_static_weight", type=float, default=0.5,
-                                 help="weight for static scoring in TFVTG")
-        self.parser.add_argument("--tfvtg_smooth_win", type=int, default=3,
-                                 help="smooth window size for TFVTG scoring")
-        self.parser.add_argument("--tfvtg_pair_chunk", type=int, default=128,
-                                 help="pair chunk size for TFVTG scoring in VCMR")
 
     def display_save(self, opt):
         args = vars(opt)
-        # Display settings
+
         print("------------ Options -------------\n{}\n-------------------".format({str(k): str(v) for k, v in
                                                                                     sorted(args.items())}))
-        # Save settings
+
         if not isinstance(self, TestOptions):
-            option_file_path = os.path.join(opt.results_dir, self.saved_option_filename)  # not yaml file indeed
+            option_file_path = os.path.join(opt.results_dir, self.saved_option_filename)
             save_json(args, option_file_path, save_pretty=True)
 
     def parse(self):
@@ -193,16 +169,13 @@ class BaseOptions(object):
             opt.num_workers = 0
             opt.eval_query_bsz = 100
         if isinstance(self, TestOptions):
-            # modify model_dir to absolute path
+
             opt.model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results", opt.model_dir)
             saved_options = load_json(os.path.join(opt.model_dir, self.saved_option_filename))
-            for arg in saved_options:  # use saved options to overwrite all BaseOptions args.
+            for arg in saved_options:
                 if arg not in ["results_root", "num_workers", "nms_thd", "debug",
                                "eval_split_name", "eval_path", "eval_query_bsz", "eval_context_bsz",
-                               "max_pred_l", "min_pred_l", "external_inference_vr_res_path",
-                               "scoring_method", "score_theta", "tfvtg_stride", "tfvtg_max_stride",
-                               "tfvtg_dynamic_weight",
-                               "tfvtg_static_weight", "tfvtg_smooth_win", "tfvtg_pair_chunk"]:
+                               "max_pred_l", "min_pred_l", "external_inference_vr_res_path"]:
                     setattr(opt, arg, saved_options[arg])
         else:
             if opt.exp_id is None:
@@ -213,15 +186,13 @@ class BaseOptions(object):
             opt.results_dir = os.path.join(opt.results_root, "-".join([opt.dset_name, opt.ctx_mode, opt.exp_id,
                                                                        time.strftime("%Y_%m_%d_%H_%M_%S")]))
             mkdirp(opt.results_dir)
-            # save a copy of current code
+
             code_dir = os.path.dirname(os.path.realpath(__file__))
             code_zip_filename = os.path.join(opt.results_dir, "code.zip")
             make_zipfile(code_dir, code_zip_filename, enclosing_dir="code", exclude_dirs_substring="results",
                          exclude_dirs=["results", "debug_results", "__pycache__"],
                          exclude_extensions=[".pyc", ".ipynb", ".swap"],)
         self.display_save(opt)
-        if "sub" in opt.ctx_mode:
-            raise ValueError("Subtitles are disabled in this project.")
         if getattr(opt, "use_generative_augmentation", False) and not getattr(opt, "use_fusion_encoder", False):
             raise ValueError("--use_fusion_encoder is required when --use_generative_augmentation is enabled.")
         if getattr(opt, "use_generative_augmentation", False):
@@ -229,8 +200,6 @@ class BaseOptions(object):
                 raise ValueError("--lm_max_len must be >= 2 for LM loss.")
             if opt.lm_max_len > opt.max_desc_l:
                 raise ValueError("--lm_max_len must be <= --max_desc_l to match decoder positional embeddings.")
-        if opt.score_theta is not None and not (0.0 <= opt.score_theta <= 1.0):
-            raise ValueError("--score_theta must be in [0, 1].")
         if opt.hard_negative_start_epoch != -1:
             if opt.hard_pool_size > opt.bsz:
                 print("[WARNING] hard_pool_size is larger than bsz")
@@ -241,15 +210,13 @@ class BaseOptions(object):
         opt.tensorboard_log_dir = os.path.join(opt.results_dir, self.tensorboard_log_dir)
         opt.device = torch.device("cuda:%d" % opt.device_ids[0] if opt.device >= 0 else "cpu")
         opt.h5driver = None if opt.no_core_driver else "core"
-        # num_workers > 1 will only work with "core" mode, i.e., memory-mapped hdf5
+
         opt.num_workers = 1 if opt.no_core_driver else opt.num_workers
         opt.pin_memory = not opt.no_pin_memory
-        if "video" in opt.ctx_mode and opt.vid_feat_size > 3000:  # 3072, the normalized concatenation of resnet+i3d
+        if "video" in opt.ctx_mode and opt.vid_feat_size > 3000:
             assert opt.no_norm_vfeat
         if "tef" in opt.ctx_mode and "video" in opt.ctx_mode:
             opt.vid_feat_size += 2
-        if "tef" in opt.ctx_mode and "sub" in opt.ctx_mode:
-            opt.sub_feat_size += 2
         self.opt = opt
         return opt
 
@@ -258,7 +225,7 @@ class TestOptions(BaseOptions):
     """add additional options for evaluating"""
     def initialize(self):
         BaseOptions.initialize(self)
-        # also need to specify --eval_split_name
+
         self.parser.add_argument("--eval_id", type=str, help="evaluation id")
         self.parser.add_argument("--model_dir", type=str,
                                  help="dir contains the model file, will be converted to absolute path afterwards")
@@ -268,4 +235,3 @@ class TestOptions(BaseOptions):
                                       "VCMR: Video Corpus Moment Retrieval;"
                                       "SVMR: Single Video Moment Retrieval;"
                                       "VR: regular Video Retrieval. (will be performed automatically with VCMR)")
-        # Note: scoring_method and tfvtg_* parameters are now inherited from BaseOptions

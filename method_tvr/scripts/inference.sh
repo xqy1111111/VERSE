@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${ROOT_DIR}/setup.sh"
 cd "${ROOT_DIR}"
-VERIFIED_ROOT="${VERIFIED_ROOT:-/home/qyxiao/data/VERIFIED_FIG_2024}"
+VERIFIED_ROOT="${VERIFIED_ROOT:-/data/VERIFIED_FIG_2024}"
 FIG_ANNO_ROOT="${FIG_ANNO_ROOT:-${VERIFIED_ROOT}/VERIFIED/fine-grained-anno}"
 # Usage:
 # bash method/scripts/inference.sh MODEL_DIR SPLIT_NAME [dset_name] [ANY_OTHER_PYTHON_ARGS]

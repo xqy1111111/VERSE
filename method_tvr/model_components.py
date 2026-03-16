@@ -43,7 +43,7 @@ class SmoothedCrossEntropyLoss(nn.Module):
             labels = labels * (1 - smooth_eps) + smooth_eps / num_classes
         else:
             mask = mask.type(probs.dtype)
-            valid_samples = torch.sum(mask, dim=-1, keepdim=True, dtype=probs.dtype)  # (N, 1)
+            valid_samples = torch.sum(mask, dim=-1, keepdim=True, dtype=probs.dtype)
             eps_per_sample = smooth_eps / valid_samples
             labels = (labels * (1 - smooth_eps) + eps_per_sample) * mask
         loss = -torch.sum(labels * probs, dim=-1)
@@ -52,7 +52,7 @@ class SmoothedCrossEntropyLoss(nn.Module):
         elif self.reduction == 'mean':
             return torch.mean(loss)
         else:
-            return loss  # (N, )
+            return loss
 
 
 class MILNCELoss(nn.Module):
@@ -120,7 +120,7 @@ class DepthwiseSeparableConv(nn.Module):
             out = F.relu(self.pointwise_conv(self.depthwise_conv(x)), inplace=True)
         else:
             out = self.pointwise_conv(self.depthwise_conv(x))
-        return out.transpose(1, 2)  # (N, L, D)
+        return out.transpose(1, 2)
 
 
 class ConvEncoder(nn.Module):
@@ -135,7 +135,7 @@ class ConvEncoder(nn.Module):
         :param x: (N, L, D)
         :return: (N, L, D)
         """
-        return self.layer_norm(self.dropout(self.conv(x)) + x)  # (N, L, D)
+        return self.layer_norm(self.dropout(self.conv(x)) + x)
 
 
 class TrainablePositionalEncoding(nn.Module):
@@ -149,7 +149,7 @@ class TrainablePositionalEncoding(nn.Module):
     def forward(self, input_feat):
         bsz, seq_length = input_feat.shape[:2]
         position_ids = torch.arange(seq_length, dtype=torch.long, device=input_feat.device)
-        position_ids = position_ids.unsqueeze(0).repeat(bsz, 1)  # (N, L)
+        position_ids = position_ids.unsqueeze(0).repeat(bsz, 1)
         position_embeddings = self.position_embeddings(position_ids)
         embeddings = self.LayerNorm(input_feat + position_embeddings)
         embeddings = self.dropout(embeddings)
@@ -158,7 +158,7 @@ class TrainablePositionalEncoding(nn.Module):
     def add_position_emb(self, input_feat):
         bsz, seq_length = input_feat.shape[:2]
         position_ids = torch.arange(seq_length, dtype=torch.long, device=input_feat.device)
-        position_ids = position_ids.unsqueeze(0).repeat(bsz, 1)  # (N, L)
+        position_ids = position_ids.unsqueeze(0).repeat(bsz, 1)
         position_embeddings = self.position_embeddings(position_ids)
         return input_feat + position_embeddings
 
@@ -181,7 +181,7 @@ class LinearLayer(nn.Module):
         x = self.net(x)
         if self.relu:
             x = F.relu(x, inplace=True)
-        return x  # (N, L, D)
+        return x
 
 
 class BertLayer(nn.Module):
@@ -300,9 +300,9 @@ class BertSelfAttention(nn.Module):
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
     def transpose_for_scores(self, x):
-        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)  # (N, L, nh, dh)
+        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(*new_x_shape)
-        return x.permute(0, 2, 1, 3)  # (N, nh, L, dh)
+        return x.permute(0, 2, 1, 3)
 
     def forward(self, query_states, key_states, value_states, attention_mask, return_attention=False):
         """
@@ -312,27 +312,27 @@ class BertSelfAttention(nn.Module):
             value_states: (N, L, D)
             attention_mask: (N, Lq, L)
         """
-        # only need to mask the dimension where the softmax (last dim) is applied, as another dim (second last)
-        # will be ignored in future computation anyway
-        attention_mask = (1 - attention_mask.unsqueeze(1)) * -10000.  # (N, 1, Lq, L)
+
+
+        attention_mask = (1 - attention_mask.unsqueeze(1)) * -10000.
         mixed_query_layer = self.query(query_states)
         mixed_key_layer = self.key(key_states)
         mixed_value_layer = self.value(value_states)
-        # transpose
-        query_layer = self.transpose_for_scores(mixed_query_layer)  # (N, nh, Lq, dh)
-        key_layer = self.transpose_for_scores(mixed_key_layer)  # (N, nh, L, dh)
-        value_layer = self.transpose_for_scores(mixed_value_layer)  # (N, nh, L, dh)
-        # Take the dot product between "query" and "key" to get the raw attention scores.
-        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))  # (N, nh, Lq, L)
+
+        query_layer = self.transpose_for_scores(mixed_query_layer)
+        key_layer = self.transpose_for_scores(mixed_key_layer)
+        value_layer = self.transpose_for_scores(mixed_value_layer)
+
+        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
-        # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
+
         attention_scores = attention_scores + attention_mask
-        # Normalize the attention scores to probabilities.
+
         attention_probs = nn.Softmax(dim=-1)(attention_scores)
-        # This is actually dropping out entire tokens to attend to, which might
-        # seem a bit unusual, but is taken from the original Transformer paper.
+
+
         attention_probs = self.dropout(attention_probs)
-        # compute output context
+
         context_layer = torch.matmul(attention_probs, value_layer)
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)

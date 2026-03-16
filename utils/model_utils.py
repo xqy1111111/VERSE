@@ -1,7 +1,3 @@
-__author__ = "Jie Lei"
-
-#  ref: https://github.com/lichengunc/MAttNet/blob/master/lib/layers/lang_encoder.py#L11
-#  ref: https://github.com/easonnie/flint/blob/master/torch_util.py#L272
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
@@ -102,4 +98,3 @@ def count_parameters(model, verbose=True):
     if verbose:
         print("Parameter Count: all {:,d}; trainable {:,d}".format(n_all, n_trainable))
     return n_all, n_trainable
-

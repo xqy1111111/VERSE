@@ -22,15 +22,9 @@ feature_root=data/tvr_feature_release
 results_root=method_tvr/results
 vid_feat_size=2048
 extra_args=()
-VERIFIED_ROOT="${VERIFIED_ROOT:-/home/qyxiao/data/VERIFIED_FIG_2024}"
+VERIFIED_ROOT="${VERIFIED_ROOT:-/data/VERIFIED_FIG_2024}"
 FIG_ANNO_ROOT="${FIG_ANNO_ROOT:-${VERIFIED_ROOT}/VERIFIED/fine-grained-anno}"
 FIG_FEAT_ROOT="${FIG_FEAT_ROOT:-${VERIFIED_ROOT}/features/VERIFIED_features/VERIFIED}"
-
-if [[ ${ctx_mode} == *"sub"* ]] || [[ ${ctx_mode} == "sub" ]]; then
-    echo "Subtitles are disabled in this project."
-    exit 1
-fi
-
 
 case ${dset_name} in
     tvr)

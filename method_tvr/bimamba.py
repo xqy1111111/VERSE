@@ -20,7 +20,7 @@ def _normalize_mask(attention_mask: Optional[torch.Tensor]) -> Optional[torch.Te
 
 def _reverse_by_length(x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
     bsz, seq_len, dim = x.shape
-    idx = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(bsz, -1)  # (B, L)
+    idx = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(bsz, -1)
 
     reversed_idx = torch.where(
         idx < lengths.unsqueeze(1),
@@ -63,7 +63,7 @@ class BiMambaEncoderLayer(nn.Module):
         else:
             lengths = mask.long().sum(dim=1)
 
-        # Pre-norm
+        # Pre-norm block before bidirectional Mamba.
         x = self.norm(input_tensor)
         if mask is not None:
             x = x * mask.unsqueeze(-1)
@@ -88,10 +88,10 @@ class BiMambaEncoderLayer(nn.Module):
 
         y = self.dropout(y)
 
-        # Residual connection
+        # Residual connection after sequence mixing.
         x = input_tensor + y
 
-        # FFN with pre-norm
+        # Feed-forward refinement with a second residual connection.
         y = self.ffn_norm(x)
         y = self.ffn(y)
 

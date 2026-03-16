@@ -4,13 +4,11 @@ import torch
 from easydict import EasyDict as EDict
 
 from method_tvr.model import ReLoCLNet
-from method_tvr.tfvtg_scoring import compute_tfvtg_st_ed_probs
 
 
 def build_config(args):
     cfg = EDict(
         visual_input_size=64,
-        sub_input_size=2,
         query_input_size=64,
         hidden_size=32,
         conv_kernel_size=3,
@@ -31,7 +29,6 @@ def build_config(args):
         lw_st_ed=0.01,
         use_hard_negative=False,
         hard_pool_size=10,
-        use_sub=False,
         backbone_type=args.backbone_type,
         use_generative_augmentation=args.use_generative_augmentation,
         use_fusion_encoder=args.use_fusion_encoder or args.use_generative_augmentation,
@@ -68,8 +65,6 @@ def main():
     query_mask = torch.ones(bsz, lq, device=device)
     video_feat = torch.randn(bsz, lv, cfg.visual_input_size, device=device)
     video_mask = torch.ones(bsz, lv, device=device)
-    sub_feat = torch.zeros(bsz, 2, 2, device=device)
-    sub_mask = torch.zeros(bsz, 2, device=device)
     st_ed_indices = torch.tensor([[1, 4], [2, 6]], device=device)
     match_labels = torch.zeros(bsz, lv, dtype=torch.long, device=device)
     match_labels[:, 1:6] = 1
@@ -80,22 +75,17 @@ def main():
         query_input_ids = torch.randint(0, cfg.lm_vocab_size, (bsz, lq), device=device)
         query_attn_mask = torch.ones(bsz, lq, dtype=torch.long, device=device)
 
-    loss, loss_dict = model(query_feat, query_mask, video_feat, video_mask, sub_feat, sub_mask,
+    loss, loss_dict = model(query_feat, query_mask, video_feat, video_mask,
                             st_ed_indices, match_labels, query_input_ids, query_attn_mask)
     assert torch.isfinite(loss).all()
 
     model.eval()
     with torch.no_grad():
-        _, _, _, _, x_video_feat, _ = model.encode_context(video_feat, video_mask, sub_feat, sub_mask,
-                                                           return_mid_output=True)
+        _, _, x_video_feat = model.encode_context(video_feat, video_mask, return_mid_output=True)
         q2c_scores, st_prob, ed_prob, encoded_query = model.get_pred_from_raw_query(
-            query_feat, query_mask, x_video_feat, video_mask, None, None, cross=False, return_encoded_query=True)
+            query_feat, query_mask, x_video_feat, video_mask, cross=False, return_encoded_query=True)
         assert st_prob.shape == (bsz, lv)
         assert ed_prob.shape == (bsz, lv)
-        temporal_curve = model.get_temporal_curve(encoded_query, query_mask, x_video_feat, video_mask)
-        st_tf, ed_tf = compute_tfvtg_st_ed_probs(temporal_curve, video_mask, stride=2, max_stride=6)
-        assert st_tf.shape == (bsz, lv)
-        assert ed_tf.shape == (bsz, lv)
     print("smoke_synthetic: OK")
 
 

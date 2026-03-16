@@ -30,8 +30,8 @@ class QueryDecoder(nn.Module):
         """
         x = self.token_embed(input_ids)
         x = self.pos_embed(x)
-        x = x.transpose(0, 1)  # (T, B, D)
-        memory = memory.transpose(0, 1)  # (S, B, D)
+        x = x.transpose(0, 1)
+        memory = memory.transpose(0, 1)
         tgt_mask = _generate_causal_mask(x.size(0), x.device)
         tgt_key_padding_mask = attention_mask == 0
         memory_key_padding_mask = memory_mask == 0
@@ -42,5 +42,5 @@ class QueryDecoder(nn.Module):
             tgt_key_padding_mask=tgt_key_padding_mask,
             memory_key_padding_mask=memory_key_padding_mask,
         )
-        out = out.transpose(0, 1)  # (B, T, D)
+        out = out.transpose(0, 1)
         return self.lm_head(out)

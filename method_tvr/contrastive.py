@@ -98,23 +98,23 @@ def batch_video_query_loss(video, query, match_labels, mask, measure='JSD'):
         :param measure: estimator of the mutual information
         :return: L_{qv}
     """
-    # generate mask
-    pos_mask = match_labels.type(torch.float32)  # (bsz, Lv)
-    neg_mask = (torch.ones_like(pos_mask) - pos_mask) * mask  # (bsz, Lv)
 
-    # compute scores
-    query = query.unsqueeze(2)  # (bsz, dim, 1)
-    res = torch.matmul(video, query).squeeze(2)  # (bsz, Lv)
+    pos_mask = match_labels.type(torch.float32)
+    neg_mask = (torch.ones_like(pos_mask) - pos_mask) * mask
 
-    # computing expectation for the MI between the target moment (positive samples) and query.
+
+    query = query.unsqueeze(2)
+    res = torch.matmul(video, query).squeeze(2)
+
+
     E_pos = get_positive_expectation(res * pos_mask, measure, average=False)
-    E_pos = torch.sum(E_pos * pos_mask, dim=1) / (torch.sum(pos_mask, dim=1) + 1e-12)  # (bsz, )
+    E_pos = torch.sum(E_pos * pos_mask, dim=1) / (torch.sum(pos_mask, dim=1) + 1e-12)
 
-    # computing expectation for the MI between clips except target moment (negative samples) and query.
+
     E_neg = get_negative_expectation(res * neg_mask, measure, average=False)
-    E_neg = torch.sum(E_neg * neg_mask, dim=1) / (torch.sum(neg_mask, dim=1) + 1e-12)  # (bsz, )
+    E_neg = torch.sum(E_neg * neg_mask, dim=1) / (torch.sum(neg_mask, dim=1) + 1e-12)
 
-    E = E_neg - E_pos  # (bsz, )
+    E = E_neg - E_pos
     return torch.mean(E)
 
 
@@ -129,38 +129,38 @@ def batch_video_video_loss(video, st_ed_indices, match_labels, mask, measure='JS
         :param measure: estimator of the mutual information
         :return: L_{vv}
     """
-    # generate mask
-    pos_mask = match_labels.type(torch.float32)  # (bsz, Lv)
-    neg_mask = (torch.ones_like(pos_mask) - pos_mask) * mask  # (bsz, Lv)
 
-    # select start and end indices features
-    st_indices, ed_indices = st_ed_indices[:, 0], st_ed_indices[:, 1]  # (bsz, )
-    batch_indices = torch.arange(0, video.shape[0]).long()  # (bsz, )
-    video_s = video[batch_indices, st_indices, :]  # (bsz, dim)
-    video_e = video[batch_indices, ed_indices, :]  # (bsz, dim)
+    pos_mask = match_labels.type(torch.float32)
+    neg_mask = (torch.ones_like(pos_mask) - pos_mask) * mask
 
-    # compute scores
-    video_s = video_s.unsqueeze(2)  # (bsz, dim, 1)
-    res_s = torch.matmul(video, video_s).squeeze(2)  # (bsz, Lv), fusion between the start clips and the video
-    video_e = video_e.unsqueeze(2)  # (bsz, dim, 1)
-    res_e = torch.matmul(video, video_e).squeeze(2)  # (bsz, Lv), fusion between the end clips and the video
 
-    # start clips: MI expectation for all positive samples
+    st_indices, ed_indices = st_ed_indices[:, 0], st_ed_indices[:, 1]
+    batch_indices = torch.arange(0, video.shape[0]).long()
+    video_s = video[batch_indices, st_indices, :]
+    video_e = video[batch_indices, ed_indices, :]
+
+
+    video_s = video_s.unsqueeze(2)
+    res_s = torch.matmul(video, video_s).squeeze(2)
+    video_e = video_e.unsqueeze(2)
+    res_e = torch.matmul(video, video_e).squeeze(2)
+
+
     E_s_pos = get_positive_expectation(res_s * pos_mask, measure, average=False)
-    E_s_pos = torch.sum(E_s_pos * pos_mask, dim=1) / (torch.sum(pos_mask, dim=1) + 1e-12)  # (bsz, )
-    # end clips: MI expectation for all positive samples
+    E_s_pos = torch.sum(E_s_pos * pos_mask, dim=1) / (torch.sum(pos_mask, dim=1) + 1e-12)
+
     E_e_pos = get_positive_expectation(res_e * pos_mask, measure, average=False)
     E_e_pos = torch.sum(E_e_pos * pos_mask, dim=1) / (torch.sum(pos_mask, dim=1) + 1e-12)
     E_pos = E_s_pos + E_e_pos
 
-    # start clips: MI expectation for all negative samples
+
     E_s_neg = get_negative_expectation(res_s * neg_mask, measure, average=False)
     E_s_neg = torch.sum(E_s_neg * neg_mask, dim=1) / (torch.sum(neg_mask, dim=1) + 1e-12)
 
-    # end clips: MI expectation for all negative samples
+
     E_e_neg = get_negative_expectation(res_e * neg_mask, measure, average=False)
     E_e_neg = torch.sum(E_e_neg * neg_mask, dim=1) / (torch.sum(neg_mask, dim=1) + 1e-12)
     E_neg = E_s_neg + E_e_neg
 
-    E = E_neg - E_pos  # (bsz, )
+    E = E_neg - E_pos
     return torch.mean(E)

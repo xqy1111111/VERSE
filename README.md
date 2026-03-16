@@ -17,7 +17,7 @@ https://arxiv.org/pdf/2105.06247.pdf).
 This repo now includes a `uv` environment definition:
 
 ```shell
-cd /data1/qyxiao/ACMMM2
+cd /path/to/ACMMM2
 uv python install 3.9
 uv venv --python 3.9
 source .venv/bin/activate
@@ -43,8 +43,8 @@ conda install -c conda-forge transformers tensorboard tqdm easydict
 ## Getting started
 1. Clone this repository
 ```shell
-$ git clone git@github.com:IsaacChanghau/ReLoCLNet.git
-$ cd ReLoCLNet
+$ git clone <repo-url>
+$ cd ACMMM2
 ```
 
 2. Download features
@@ -82,7 +82,7 @@ $ bash method_tvr/scripts/inference.sh MODEL_DIR_NAME SPLIT_NAME
 For more details about evaluation and submission, please refer [TVRetrieval#training-and-inference](
 https://github.com/jayleicn/TVRetrieval#training-and-inference).
 
-## FIG Ablations (BiMamba / GAR / TFVTG)
+## FIG Ablations (BiMamba / GAR)
 
 ```shell
 # Baseline: ReLoCLNet + BiMamba
@@ -91,13 +91,6 @@ bash method_tvr/scripts/run_baseline_bimamba.sh charades_fig video_tef resnet re
 # Exp1: + Generative Aug (Fusion Encoder + decoder LM loss, training only)
 bash method_tvr/scripts/run_exp1_gar.sh charades_fig video_tef resnet reloclnet_charades_fig_gar \
   --tokenizer_name_or_path bert-base-uncased
-  # run_exp1_gar.sh already enables --use_fusion_encoder
-
-# Exp2: + TFVTG scoring (inference only, attention-based temporal curve)
-model_dir=$(ls -td method_tvr/results/charades_fig-video_tef-reloclnet_charades_fig_gar-* | head -n1)
-model_dir=$(basename "$model_dir")
-bash method_tvr/scripts/run_exp2_tfvtg.sh "$model_dir" test charades_fig \
-  --tfvtg_pair_chunk 128
 ```
 
 Metrics are computed with VCMR/SVMR/VR R@{1,5,10,100} at IoU {0.5, 0.7} when GT is available. For FIG datasets,
@@ -128,7 +121,6 @@ If you feel this project helpful to your research, please cite our work.
 
 ## References (Papers/Code)
 - GAR (ACL 2021): https://arxiv.org/abs/2009.08553 ; code: https://github.com/morningmoni/GAR
-- TFVTG (ECCV 2024): https://arxiv.org/abs/2408.16219 ; no official code repo found as of now
 
 ## TODO
 - Upload codes for ActivityNet Captions dataset
