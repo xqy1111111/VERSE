@@ -76,10 +76,11 @@ def generator_response_schema() -> Dict:
         "type": "object",
         "additionalProperties": False,
         "properties": {
+            "anchor_analysis": {"type": "string", "minLength": 4, "maxLength": 400},
             "hard_negatives": {"type": "array", "items": variant_schema, "minItems": 0},
             "hard_positives": {"type": "array", "items": variant_schema, "minItems": 0},
         },
-        "required": ["hard_negatives", "hard_positives"],
+        "required": ["anchor_analysis", "hard_negatives", "hard_positives"],
     }
 
 
@@ -166,10 +167,13 @@ def validate_generator_response(
     allowed_neg_types: Iterable[str],
     allowed_pos_types: Iterable[str],
     allowed_severities: Iterable[int],
+    return_anchor_analysis: bool = False,
 ) -> Tuple[List[Dict], List[Dict]]:
     _assert_type(payload, dict, "generator_response")
-    required = ["hard_negatives", "hard_positives"]
+    required = ["anchor_analysis", "hard_negatives", "hard_positives"]
     _assert_no_extra_keys(payload, required, "generator_response")
+    _assert_type(payload["anchor_analysis"], str, "anchor_analysis")
+    _validate_single_sentence_text(payload["anchor_analysis"], "anchor_analysis")
     _assert_type(payload["hard_negatives"], list, "hard_negatives")
     _assert_type(payload["hard_positives"], list, "hard_positives")
 
@@ -188,6 +192,8 @@ def validate_generator_response(
             raise ValueError("hard_positives[{}] has wrong relation_label '{}'".format(idx, normalized["relation_label"]))
         hard_positives.append(normalized)
 
+    if return_anchor_analysis:
+        return hard_negatives, hard_positives, payload["anchor_analysis"].strip()
     return hard_negatives, hard_positives
 
 
@@ -214,14 +220,17 @@ def validate_verifier_response(payload: Dict) -> Dict:
     confidence = float(confidence)
     if confidence < 0.0 or confidence > 1.0:
         raise ValueError("confidence must be in [0, 1]")
-
-    _validate_single_sentence_text(reason, "reason")
+    if not reason or not str(reason).strip():
+        raise ValueError("reason cannot be empty")
+    reason_normalized = " ".join(str(reason).split())
+    if len(reason_normalized) > 400:
+        raise ValueError("reason is too long")
 
     return {
         "verdict": verdict,
         "semantic_relation": semantic_relation,
         "confidence": confidence,
-        "reason": reason.strip(),
+        "reason": reason_normalized,
     }
 
 

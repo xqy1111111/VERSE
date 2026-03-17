@@ -16,7 +16,7 @@ dist/
 pip-wheel-metadata/
 
 # Virtual environments
-.env
+.env*
 .venv/
 env/
 venv/

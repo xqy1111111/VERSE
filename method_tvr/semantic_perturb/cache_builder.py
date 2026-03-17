@@ -228,8 +228,8 @@ def _validate_build_config(cfg: SemanticBuildConfig) -> None:
         raise ValueError("Semantic cache builder only supports backend='llm' for now")
     if cfg.num_hard_neg < 0 or cfg.num_hard_pos < 0:
         raise ValueError("num_hard_neg and num_hard_pos must be >= 0")
-    if cfg.max_retries_same_backend < 0:
-        raise ValueError("max_retries_same_backend must be >= 0")
+    if cfg.max_retries_same_backend < -1:
+        raise ValueError("max_retries_same_backend must be >= -1")
     if cfg.temperature < 0:
         raise ValueError("temperature must be >= 0")
     if cfg.llm_transport not in {"remote_api", "local_xgrammar"}:
@@ -311,11 +311,12 @@ def _build_one_record(
     accepted_neg: List[Dict] = []
     accepted_pos: List[Dict] = []
 
-    max_attempts = cfg.max_retries_same_backend + 1
+    infinite_retries = int(cfg.max_retries_same_backend) == -1
+    max_attempts = None if infinite_retries else int(cfg.max_retries_same_backend) + 1
     attempt = 0
     last_error = None
 
-    while attempt < max_attempts:
+    while True:
         attempt += 1
         try:
             raw_neg, raw_pos, _ = generator.generate(
@@ -386,6 +387,16 @@ def _build_one_record(
                     "desc_id={} unrecoverable auth/permission error: {}".format(record["desc_id"], err_text)
                 ) from err
             last_error = err
+            if infinite_retries and (attempt % 20 == 0):
+                _log(
+                    "retry-forever: desc_id={} attempts={} last_error={}".format(
+                        int(record["desc_id"]),
+                        attempt,
+                        err_text[:160],
+                    )
+                )
+            if not infinite_retries and attempt >= int(max_attempts):
+                break
 
     raise BuildFailure("desc_id={} build failed after {} attempts: {}".format(record["desc_id"], max_attempts, last_error))
 
@@ -520,8 +531,6 @@ def build_semantic_cache(cfg: SemanticBuildConfig) -> Dict[str, str]:
         existing_records = _load_existing_cache_records(out_paths["cache_jsonl"])
         if existing_records:
             _validate_resume_manifest_if_present(cfg, out_paths["manifest_json"], source_hash)
-            existing_indices: List[int] = []
-            existing_desc_ids: List[int] = []
             for item in existing_records:
                 desc_id = int(item["desc_id"])
                 if desc_id in completed_desc_ids:
@@ -530,23 +539,16 @@ def build_semantic_cache(cfg: SemanticBuildConfig) -> Dict[str, str]:
                 if src_idx is None:
                     raise RuntimeError("Existing cache has desc_id not in source annotations: {}".format(desc_id))
                 completed_desc_ids.add(desc_id)
-                existing_indices.append(src_idx)
-                existing_desc_ids.append(desc_id)
-
-            expected_indices = list(range(1, len(existing_indices) + 1))
-            if existing_indices != expected_indices:
-                raise RuntimeError(
-                    "Resume requires existing cache to be a source-order prefix; got indices head={} tail={}".format(
-                        existing_indices[:5],
-                        existing_indices[-5:] if existing_indices else [],
-                    )
-                )
 
             cache_records.extend(existing_records)
+            missing_prefix = len(
+                [idx for idx in range(1, min(total, len(existing_records)) + 1) if int(records[idx - 1]["desc_id"]) not in completed_desc_ids]
+            )
             _log(
-                "resume: loaded {} existing records from {}".format(
+                "resume: loaded {} existing records from {}, missing_prefix={}".format(
                     len(existing_records),
                     out_paths["cache_jsonl"],
+                    missing_prefix,
                 )
             )
 
@@ -633,7 +635,8 @@ def build_semantic_cache(cfg: SemanticBuildConfig) -> Dict[str, str]:
                 )
         else:
             ordered_results: Dict[int, Dict] = {}
-            next_idx = records_to_build[0][0]
+            pending_indices = [idx for idx, _ in records_to_build]
+            next_pos = 0
             with ThreadPoolExecutor(max_workers=int(cfg.build_workers)) as executor:
                 future_to_idx = {
                     executor.submit(
@@ -658,8 +661,9 @@ def build_semantic_cache(cfg: SemanticBuildConfig) -> Dict[str, str]:
                             _log("fatal: {}".format(err))
                             raise RuntimeError("Semantic cache build aborted: {}".format(err))
                         ordered_results[int(result["idx"])] = result
-                        while next_idx in ordered_results:
-                            ready = ordered_results.pop(next_idx)
+                        while next_pos < len(pending_indices) and pending_indices[next_pos] in ordered_results:
+                            ready_idx = pending_indices[next_pos]
+                            ready = ordered_results.pop(ready_idx)
                             _consume_record_result(
                                 result=ready,
                                 cfg=cfg,
@@ -669,7 +673,7 @@ def build_semantic_cache(cfg: SemanticBuildConfig) -> Dict[str, str]:
                                 cache_records=cache_records,
                                 failures=failures,
                             )
-                            next_idx += 1
+                            next_pos += 1
                 except RuntimeError:
                     for pending in future_to_idx:
                         if not pending.done():

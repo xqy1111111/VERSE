@@ -30,14 +30,14 @@ class SemanticGenerator:
         self.num_hard_neg = int(num_hard_neg)
         self.num_hard_pos = int(num_hard_pos)
 
-    def generate(
+    def generate_with_analysis(
         self,
         *,
         anchor_text: str,
         vid_name: Optional[str],
         duration: Optional[float],
         ts,
-    ) -> Tuple[List[Dict], List[Dict], str]:
+    ) -> Tuple[List[Dict], List[Dict], str, str]:
         system_prompt = prompts.build_generator_system_prompt()
         user_prompt = prompts.build_generator_user_prompt(
             anchor_text=anchor_text,
@@ -58,10 +58,27 @@ class SemanticGenerator:
             temperature=self.temperature,
         )
         parsed = parse_strict_json(raw_json)
-        hard_negatives, hard_positives = validate_generator_response(
+        hard_negatives, hard_positives, anchor_analysis = validate_generator_response(
             parsed,
             allowed_neg_types=self.neg_types,
             allowed_pos_types=self.pos_types,
             allowed_severities=self.severity_levels,
+            return_anchor_analysis=True,
+        )
+        return hard_negatives, hard_positives, anchor_analysis, raw_json
+
+    def generate(
+        self,
+        *,
+        anchor_text: str,
+        vid_name: Optional[str],
+        duration: Optional[float],
+        ts,
+    ) -> Tuple[List[Dict], List[Dict], str]:
+        hard_negatives, hard_positives, _anchor_analysis, raw_json = self.generate_with_analysis(
+            anchor_text=anchor_text,
+            vid_name=vid_name,
+            duration=duration,
+            ts=ts,
         )
         return hard_negatives, hard_positives, raw_json

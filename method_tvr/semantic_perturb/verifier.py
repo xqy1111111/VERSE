@@ -35,3 +35,9 @@ class SemanticVerifier:
         verifier_result = validate_verifier_response(parsed)
         verifier_result["accept"] = bool(is_verifier_accept(verifier_result, candidate["relation_label"]))
         return verifier_result
+
+    def verify_batch(self, anchor_text: str, candidates) -> Dict:
+        results = []
+        for candidate in candidates:
+            results.append(self.verify(anchor_text, candidate))
+        return results
