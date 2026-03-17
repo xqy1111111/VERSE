@@ -13,6 +13,26 @@ from utils.tensor_utils import pad_sequences_1d
 logger = logging.getLogger(__name__)
 
 
+OPTIONAL_QUERY_METADATA_FIELDS = (
+    "pos_queries",
+    "neg_queries",
+    "preference_pairs",
+    "query_variants",
+    "positive_rewrites",
+    "negative_rewrites",
+    "aux_queries",
+    "auxiliary_queries",
+)
+
+
+def _extract_optional_query_metadata(raw_data):
+    query_metadata = {}
+    for key in OPTIONAL_QUERY_METADATA_FIELDS:
+        if key in raw_data:
+            query_metadata[key] = raw_data[key]
+    return query_metadata
+
+
 def _normalize_record(raw_data):
     vid_name = raw_data.get("vid_name") or raw_data.get("video")
     ts = raw_data.get("ts") or raw_data.get("time")
@@ -25,6 +45,7 @@ def _normalize_record(raw_data):
         "vid_name": vid_name,
         "duration": raw_data["duration"],
         "ts": ts,
+        "query_metadata": _extract_optional_query_metadata(raw_data),
     }
 
 
@@ -96,6 +117,8 @@ class StartEndDataset(Dataset):
             "duration": raw_data["duration"],
             "ts": raw_data["ts"],
         }
+        if raw_data.get("query_metadata"):
+            meta["query_metadata"] = raw_data["query_metadata"]
         if self.semantic_cache_lookup is not None:
             semantic_entry = self.semantic_cache_lookup.get_entry(meta["desc_id"])
             if semantic_entry is not None:
@@ -253,6 +276,8 @@ class StartEndEvalDataset(Dataset):
             "desc": raw_data["desc"],
             "vid_name": raw_data["vid_name"] if self.load_gt_video else None,
         }
+        if raw_data.get("query_metadata"):
+            meta["query_metadata"] = raw_data["query_metadata"]
         model_inputs = {"query_feat": self.get_query_feat_by_desc_id(meta["desc_id"])}
         return {"meta": meta, "model_inputs": model_inputs}
 

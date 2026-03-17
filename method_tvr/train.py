@@ -114,6 +114,12 @@ def _build_semantic_cache_from_opt(opt):
 def train_epoch(model, train_loader, optimizer, opt, epoch_i, training=True, semantic_runtime=None):
     logger.info("use train_epoch func for training: {}".format(training))
     model.train(mode=training)
+    model_core_for_log = model.module if isinstance(model, torch.nn.DataParallel) else model
+    logger.info(
+        "epoch %d retrieval_scorer=%s",
+        epoch_i,
+        getattr(model_core_for_log.config, "retrieval_scorer", "single_vector"),
+    )
     if opt.hard_negative_start_epoch != -1 and epoch_i >= opt.hard_negative_start_epoch:
         model.set_hard_negative(True, opt.hard_pool_size)
     if opt.train_span_start_epoch != -1 and epoch_i >= opt.train_span_start_epoch:
@@ -307,6 +313,7 @@ def train(model, train_dataset, train_eval_dataset, val_dataset, opt, semantic_r
 def start_training():
     logger.info("Setup config, data and model...")
     opt = BaseOptions().parse()
+    logger.info("retrieval_scorer=%s", opt.retrieval_scorer)
     set_seed(opt.seed)
     if opt.debug:  # keep the model run deterministically
         # 'cudnn.benchmark = True' enabled auto finding the best algorithm for a specific input/net config.
@@ -432,6 +439,15 @@ def start_training():
         initializer_range=opt.initializer_range,  # for linear layer
         ctx_mode=opt.ctx_mode,
         backbone_type=opt.backbone_type,
+        retrieval_scorer=opt.retrieval_scorer,
+        late_interaction_dim=opt.late_interaction_dim,
+        late_interaction_use_projection=opt.late_interaction_use_projection,
+        late_interaction_use_token_weight=opt.late_interaction_use_token_weight,
+        late_interaction_token_weight_floor=opt.late_interaction_token_weight_floor,
+        late_interaction_score_reduction=opt.late_interaction_score_reduction,
+        late_interaction_video_chunk_size=opt.late_interaction_video_chunk_size,
+        combined_retrieval_alpha=opt.combined_retrieval_alpha,
+        combined_retrieval_normalize=opt.combined_retrieval_normalize,
         use_generative_augmentation=opt.use_generative_augmentation,
         use_fusion_encoder=opt.use_fusion_encoder,
         fusion_num_layers=opt.fusion_num_layers,

@@ -102,6 +102,7 @@ def get_submission_top_n(submission, top_n=100):
 def compute_context_info(model, eval_dataset, opt):
     """Encode video contexts once and cache them for all query batches."""
     model.eval()
+    model_core = model.module if isinstance(model, torch.nn.DataParallel) else model
     eval_dataset.set_data_mode("context")
     context_dataloader = DataLoader(
         eval_dataset,
@@ -114,6 +115,7 @@ def compute_context_info(model, eval_dataset, opt):
 
     metas = []
     video_feat, video_mask = [], []
+    video_retrieval_feat = []
 
     for _, batch in tqdm(
         enumerate(context_dataloader),
@@ -129,6 +131,8 @@ def compute_context_info(model, eval_dataset, opt):
         if "video" in opt.ctx_mode:
             video_feat.append(encoded_video)
             video_mask.append(model_inputs["video_mask"])
+            if getattr(model_core, "use_late_component", False):
+                video_retrieval_feat.append(model.encode_retrieval_context(encoded_video))
 
     def cat_tensor(tensor_list):
         if len(tensor_list) == 0:
@@ -150,10 +154,17 @@ def compute_context_info(model, eval_dataset, opt):
             res_tensor[b_sizes_cumsum[i]:b_sizes_cumsum[i + 1], :seq_l[i]] = tensor_item
         return res_tensor
 
+    cached_video_feat = cat_tensor(video_feat)
+    cached_video_mask = cat_tensor(video_mask)
+    cached_video_retrieval_feat = cat_tensor(video_retrieval_feat)
+    if cached_video_retrieval_feat is None:
+        cached_video_retrieval_feat = cached_video_feat
+
     return {
         "video_metas": metas,
-        "video_feat": cat_tensor(video_feat),
-        "video_mask": cat_tensor(video_mask),
+        "video_feat": cached_video_feat,
+        "video_mask": cached_video_mask,
+        "video_retrieval_feat": cached_video_retrieval_feat,
     }
 
 
@@ -206,6 +217,7 @@ def compute_query2ctx_info_svmr_only(model, eval_dataset, opt, ctx_info, max_bef
             model_inputs["query_mask"],
             index_if_not_none(ctx_info["video_feat"], query2video_meta_indices),
             index_if_not_none(ctx_info["video_mask"], query2video_meta_indices),
+            retrieval_context_feat=index_if_not_none(ctx_info.get("video_retrieval_feat"), query2video_meta_indices),
             cross=False,
         )
 
@@ -335,6 +347,7 @@ def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=10
             model_inputs["query_mask"],
             ctx_info["video_feat"],
             ctx_info["video_mask"],
+            retrieval_context_feat=ctx_info.get("video_retrieval_feat"),
             cross=True,
         )
 
@@ -562,6 +575,7 @@ def setup_model(opt):
     loaded_model_cfg = checkpoint["model_cfg"]
     model = ReLoCLNet(loaded_model_cfg)
     model.load_state_dict(checkpoint["model"])
+    logger.info("retrieval_scorer=%s", getattr(model.config, "retrieval_scorer", "single_vector"))
     logger.info("Loaded model from epoch %s: %s", checkpoint["epoch"], opt.ckpt_filepath)
 
     if opt.device.type == "cuda":

@@ -7,6 +7,7 @@ from easydict import EasyDict as edict
 
 from method_tvr.bimamba import BiMambaEncoderLayer
 from method_tvr.contrastive import batch_video_query_loss
+from method_tvr.late_interaction import LateInteractionRetriever
 from method_tvr.model_components import (BertAttention, CrossAttentionLayer, LinearLayer,
                                          MILNCELoss, TrainablePositionalEncoding)
 from method_tvr.query_decoder import QueryDecoder
@@ -95,6 +96,31 @@ class ReLoCLNet(nn.Module):
         self.lm_pad_token_id = getattr(config, "lm_pad_token_id", 0)
         self.use_fusion_encoder = getattr(config, "use_fusion_encoder", False)
         self.fusion_num_layers = getattr(config, "fusion_num_layers", 2)
+        self.retrieval_scorer = getattr(config, "retrieval_scorer", "single_vector")
+        if self.retrieval_scorer not in {"single_vector", "late_interaction", "combined"}:
+            raise ValueError("retrieval_scorer must be one of {'single_vector', 'late_interaction', 'combined'}")
+        self.use_late_interaction = self.retrieval_scorer == "late_interaction"
+        self.use_combined_retrieval = self.retrieval_scorer == "combined"
+        self.use_late_component = self.retrieval_scorer in {"late_interaction", "combined"}
+        self.combined_retrieval_alpha = float(getattr(config, "combined_retrieval_alpha", 0.5))
+        self.combined_retrieval_normalize = str(getattr(config, "combined_retrieval_normalize", "zscore"))
+        if self.combined_retrieval_normalize not in {"none", "zscore", "minmax"}:
+            raise ValueError("combined_retrieval_normalize must be one of {'none', 'zscore', 'minmax'}")
+        if not (0.0 <= self.combined_retrieval_alpha <= 1.0):
+            raise ValueError("combined_retrieval_alpha must be in [0, 1]")
+
+        if self.use_late_component:
+            self.late_interaction_retriever = LateInteractionRetriever(
+                hidden_size=config.hidden_size,
+                interaction_dim=getattr(config, "late_interaction_dim", config.hidden_size),
+                use_projection=getattr(config, "late_interaction_use_projection", True),
+                use_token_weight=getattr(config, "late_interaction_use_token_weight", False),
+                token_weight_floor=getattr(config, "late_interaction_token_weight_floor", 0.0),
+                score_reduction=getattr(config, "late_interaction_score_reduction", "mean"),
+                video_chunk_size=getattr(config, "late_interaction_video_chunk_size", 256),
+            )
+        else:
+            self.late_interaction_retriever = None
 
         if self.use_generative_augmentation:
             self.query_decoder = QueryDecoder(
@@ -188,12 +214,13 @@ class ReLoCLNet(nn.Module):
             video_mask,
             cross=False,
             return_query_feats=True,
-            return_encoded_query=self.use_fusion_encoder,
+            return_encoded_query=self.use_fusion_encoder or self.use_late_component,
         )
-        if self.use_fusion_encoder:
+        if self.use_fusion_encoder or self.use_late_component:
             video_query, query_context_scores, st_prob, ed_prob, encoded_query = outputs
         else:
             video_query, query_context_scores, st_prob, ed_prob = outputs
+            encoded_query = None
 
         loss_fcl = 0
         if self.config.lw_fcl != 0:
@@ -202,8 +229,17 @@ class ReLoCLNet(nn.Module):
 
         loss_vcl = 0
         if self.config.lw_vcl != 0:
-            mid_video_q2ctx_scores = self.get_unnormalized_video_level_scores(video_query, mid_x_video_feat, video_mask)
-            mid_video_q2ctx_scores, _ = torch.max(mid_video_q2ctx_scores, dim=1)
+            if self.retrieval_scorer != "single_vector":
+                mid_video_q2ctx_scores = self._get_retrieval_scores(
+                    video_query=video_query,
+                    encoded_query=encoded_query,
+                    query_mask=query_mask,
+                    context_feat=mid_x_video_feat,
+                    context_mask=video_mask,
+                )
+            else:
+                mid_video_q2ctx_scores = self.get_unnormalized_video_level_scores(video_query, mid_x_video_feat, video_mask)
+                mid_video_q2ctx_scores, _ = torch.max(mid_video_q2ctx_scores, dim=1)
             loss_vcl = self.nce_criterion(mid_video_q2ctx_scores)
             loss_vcl = self.config.lw_vcl * loss_vcl
 
@@ -297,13 +333,80 @@ class ReLoCLNet(nn.Module):
         query_context_scores = mask_logits(query_context_scores, context_mask)
         return query_context_scores
 
+    def _normalize_retrieval_scores(self, scores):
+        if self.combined_retrieval_normalize == "none":
+            return scores
+        if self.combined_retrieval_normalize == "zscore":
+            mean = scores.mean(dim=1, keepdim=True)
+            std = scores.std(dim=1, keepdim=True, unbiased=False).clamp(min=1e-6)
+            return (scores - mean) / std
+        if self.combined_retrieval_normalize == "minmax":
+            min_v = scores.min(dim=1, keepdim=True).values
+            max_v = scores.max(dim=1, keepdim=True).values
+            denom = (max_v - min_v).clamp(min=1e-6)
+            return (scores - min_v) / denom
+        raise ValueError("Unsupported combined_retrieval_normalize: {}".format(self.combined_retrieval_normalize))
+
+    def encode_retrieval_context(self, context_feat):
+        if self.use_late_component:
+            return self.late_interaction_retriever.prepare_context_vectors(context_feat)
+        return context_feat
+
+    def _get_retrieval_scores(
+        self,
+        video_query,
+        encoded_query,
+        query_mask,
+        context_feat,
+        context_mask,
+        late_context_feat=None,
+        late_context_is_prepared=False,
+    ):
+        if self.use_late_component:
+            if encoded_query is None:
+                raise ValueError("encoded_query is required for retrieval_scorer={}".format(self.retrieval_scorer))
+            if late_context_feat is None:
+                late_context_feat = context_feat
+                late_context_is_prepared = False
+            late_scores = self.late_interaction_retriever(
+                query_vectors=encoded_query,
+                query_mask=query_mask,
+                context_vectors=late_context_feat,
+                context_mask=context_mask,
+                context_is_prepared=late_context_is_prepared,
+            )
+            if self.use_late_interaction:
+                return late_scores
+            single_scores = self.get_video_level_scores(video_query, context_feat, context_mask)
+            single_scores = self._normalize_retrieval_scores(single_scores)
+            late_scores = self._normalize_retrieval_scores(late_scores)
+            alpha = self.combined_retrieval_alpha
+            return (1.0 - alpha) * single_scores + alpha * late_scores
+        return self.get_video_level_scores(video_query, context_feat, context_mask)
+
     def score_queries_to_single_context(self, query_feat, query_mask, context_feat, context_mask):
         if context_feat.size(0) != 1:
             raise ValueError("context_feat must have batch size 1, got {}".format(context_feat.size(0)))
         if context_mask.size(0) != 1:
             raise ValueError("context_mask must have batch size 1, got {}".format(context_mask.size(0)))
-        video_query = self.encode_query(query_feat, query_mask)
-        q2ctx_scores = self.get_video_level_scores(video_query, context_feat, context_mask)
+        if self.use_late_component:
+            video_query, encoded_query = self.encode_query(query_feat, query_mask, return_encoded_query=True)
+            late_context_feat = self.encode_retrieval_context(context_feat)
+            late_context_is_prepared = True
+        else:
+            video_query = self.encode_query(query_feat, query_mask)
+            encoded_query = None
+            late_context_feat = None
+            late_context_is_prepared = False
+        q2ctx_scores = self._get_retrieval_scores(
+            video_query=video_query,
+            encoded_query=encoded_query,
+            query_mask=query_mask,
+            context_feat=context_feat,
+            context_mask=context_mask,
+            late_context_feat=late_context_feat,
+            late_context_is_prepared=late_context_is_prepared,
+        )
         return q2ctx_scores.squeeze(1)
 
     def get_merged_score(self, video_query, video_feat, cross=False):
@@ -331,20 +434,35 @@ class ReLoCLNet(nn.Module):
         query_mask,
         video_feat,
         video_mask,
+        retrieval_context_feat=None,
         cross=False,
         return_query_feats=False,
         return_encoded_query=False,
         return_similarity=False,
     ):
-        if return_similarity:
-            return_encoded_query = True
+        need_encoded_query = return_encoded_query or return_similarity or self.use_late_component
 
-        if return_encoded_query:
+        if need_encoded_query:
             video_query, encoded_query = self.encode_query(query_feat, query_mask, return_encoded_query=True)
         else:
             video_query = self.encode_query(query_feat, query_mask)
+            encoded_query = None
 
-        q2ctx_scores = self.get_video_level_scores(video_query, video_feat, video_mask)
+        if retrieval_context_feat is None:
+            retrieval_context_feat = video_feat
+            retrieval_context_is_prepared = False
+        else:
+            retrieval_context_is_prepared = self.use_late_component
+
+        q2ctx_scores = self._get_retrieval_scores(
+            video_query=video_query,
+            encoded_query=encoded_query,
+            query_mask=query_mask,
+            context_feat=video_feat,
+            context_mask=video_mask,
+            late_context_feat=retrieval_context_feat,
+            late_context_is_prepared=retrieval_context_is_prepared,
+        )
         similarity = self.get_merged_score(video_query, video_feat, cross=cross)
         st_prob, ed_prob = self.get_merged_st_ed_prob(similarity, video_mask, cross=cross)
 

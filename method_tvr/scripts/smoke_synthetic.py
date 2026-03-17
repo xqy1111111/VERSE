@@ -30,6 +30,15 @@ def build_config(args):
         use_hard_negative=False,
         hard_pool_size=10,
         backbone_type=args.backbone_type,
+        retrieval_scorer=args.retrieval_scorer,
+        late_interaction_dim=0,
+        late_interaction_use_projection=not args.late_interaction_no_projection,
+        late_interaction_use_token_weight=args.late_interaction_use_token_weight,
+        late_interaction_token_weight_floor=args.late_interaction_token_weight_floor,
+        late_interaction_score_reduction=args.late_interaction_score_reduction,
+        late_interaction_video_chunk_size=32,
+        combined_retrieval_alpha=args.combined_retrieval_alpha,
+        combined_retrieval_normalize=args.combined_retrieval_normalize,
         use_generative_augmentation=args.use_generative_augmentation,
         use_fusion_encoder=args.use_fusion_encoder or args.use_generative_augmentation,
         fusion_num_layers=2,
@@ -48,6 +57,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--backbone_type", type=str, default="Transformer",
                         choices=["Transformer", "BiMamba"])
+    parser.add_argument("--retrieval_scorer", type=str, default="single_vector",
+                        choices=["single_vector", "late_interaction", "combined"])
+    parser.add_argument("--late_interaction_no_projection", action="store_true")
+    parser.add_argument("--late_interaction_use_token_weight", action="store_true")
+    parser.add_argument("--late_interaction_token_weight_floor", type=float, default=0.0)
+    parser.add_argument("--late_interaction_score_reduction", type=str, default="mean",
+                        choices=["sum", "mean"])
+    parser.add_argument("--combined_retrieval_alpha", type=float, default=0.5)
+    parser.add_argument("--combined_retrieval_normalize", type=str, default="zscore",
+                        choices=["none", "zscore", "minmax"])
     parser.add_argument("--use_generative_augmentation", action="store_true")
     parser.add_argument("--use_fusion_encoder", action="store_true")
     args = parser.parse_args()
@@ -82,10 +101,20 @@ def main():
     model.eval()
     with torch.no_grad():
         _, _, x_video_feat = model.encode_context(video_feat, video_mask, return_mid_output=True)
+        retrieval_video_feat = model.encode_retrieval_context(x_video_feat)
         q2c_scores, st_prob, ed_prob, encoded_query = model.get_pred_from_raw_query(
-            query_feat, query_mask, x_video_feat, video_mask, cross=False, return_encoded_query=True)
+            query_feat,
+            query_mask,
+            x_video_feat,
+            video_mask,
+            retrieval_context_feat=retrieval_video_feat,
+            cross=False,
+            return_encoded_query=True,
+        )
         assert st_prob.shape == (bsz, lv)
         assert ed_prob.shape == (bsz, lv)
+        assert q2c_scores.shape == (bsz, bsz)
+        assert encoded_query.shape[:2] == (bsz, lq)
     print("smoke_synthetic: OK")
 
 

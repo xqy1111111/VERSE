@@ -107,6 +107,27 @@ class BaseOptions(object):
 
         self.parser.add_argument("--backbone_type", type=str, default="Transformer",
                                  choices=["Transformer", "BiMamba"])
+        self.parser.add_argument("--retrieval_scorer", type=str, default="single_vector",
+                                 choices=["single_vector", "late_interaction", "combined"],
+                                 help="Video retrieval scorer: single_vector, late_interaction, or combined.")
+        self.parser.add_argument("--late_interaction_dim", type=int, default=0,
+                                 help="Late interaction vector dim. <=0 means using hidden_size.")
+        self.parser.add_argument("--late_interaction_no_projection", action="store_true",
+                                 help="Disable projection layers for late interaction retrieval.")
+        self.parser.add_argument("--late_interaction_use_token_weight", action="store_true",
+                                 help="Enable learned query token weighting in late interaction retrieval.")
+        self.parser.add_argument("--late_interaction_token_weight_floor", type=float, default=0.0,
+                                 help="Suppress low-weight query tokens below this threshold.")
+        self.parser.add_argument("--late_interaction_score_reduction", type=str, default="mean",
+                                 choices=["sum", "mean"],
+                                 help="Reduce token-level MaxSim by sum or mean.")
+        self.parser.add_argument("--late_interaction_video_chunk_size", type=int, default=256,
+                                 help="Chunk size over videos for late interaction scoring.")
+        self.parser.add_argument("--combined_retrieval_alpha", type=float, default=0.5,
+                                 help="Weight for late_interaction in combined retrieval scorer.")
+        self.parser.add_argument("--combined_retrieval_normalize", type=str, default="zscore",
+                                 choices=["none", "zscore", "minmax"],
+                                 help="Score normalization mode before combining retrieval branches.")
 
         self.parser.add_argument("--use_generative_augmentation", action="store_true",
                                  help="Enable decoder LM loss during training")
@@ -318,6 +339,16 @@ class BaseOptions(object):
         else:
             if opt.semantic_build_cache_only:
                 raise ValueError("--semantic_build_cache_only requires --semantic_enable.")
+
+        opt.late_interaction_use_projection = not bool(getattr(opt, "late_interaction_no_projection", False))
+        if opt.late_interaction_dim < 0:
+            raise ValueError("--late_interaction_dim must be >= 0.")
+        if opt.late_interaction_video_chunk_size <= 0:
+            raise ValueError("--late_interaction_video_chunk_size must be > 0.")
+        if opt.late_interaction_token_weight_floor < 0:
+            raise ValueError("--late_interaction_token_weight_floor must be >= 0.")
+        if not (0.0 <= opt.combined_retrieval_alpha <= 1.0):
+            raise ValueError("--combined_retrieval_alpha must be in [0, 1].")
 
         assert opt.stop_task in opt.eval_tasks_at_training
         opt.ckpt_filepath = os.path.join(opt.results_dir, self.ckpt_filename)
