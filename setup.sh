@@ -8,4 +8,7 @@ else
   export PYTHONPATH="$DIR_PWD"
 fi
 
+# Avoid HuggingFace tokenizers fork/parallelism warning in DataLoader workers.
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+
 echo "${PYTHONPATH}"
