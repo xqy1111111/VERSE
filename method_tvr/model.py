@@ -123,6 +123,12 @@ class ReLoCLNet(nn.Module):
         self.late_interaction_rerank_soft_min_gate = float(
             getattr(config, "late_interaction_rerank_soft_min_gate", 0.0)
         )
+        self.late_interaction_preserve_baseline_top1 = bool(
+            getattr(config, "late_interaction_preserve_baseline_top1", False)
+        )
+        self.late_interaction_preserve_top1_margin = float(
+            getattr(config, "late_interaction_preserve_top1_margin", 0.0)
+        )
         self.late_interaction_train_start_epoch = int(getattr(config, "late_interaction_train_start_epoch", 0))
         self.late_interaction_residual_clip = float(getattr(config, "late_interaction_residual_clip", -1.0))
         self.late_interaction_rank_head_weight = float(getattr(config, "late_interaction_rank_head_weight", 1.0))
@@ -161,6 +167,8 @@ class ReLoCLNet(nn.Module):
             raise ValueError("late_interaction_rerank_soft_temperature must be >= 0")
         if not (0.0 <= self.late_interaction_rerank_soft_min_gate <= 1.0):
             raise ValueError("late_interaction_rerank_soft_min_gate must be in [0, 1]")
+        if self.late_interaction_preserve_top1_margin < 0:
+            raise ValueError("late_interaction_preserve_top1_margin must be >= 0")
         if not (0.0 <= self.late_interaction_score_weight <= 1.0):
             raise ValueError("late_interaction_score_weight must be in [0, 1]")
         if not (0.0 <= self.late_interaction_train_score_weight <= 1.0):
@@ -487,6 +495,37 @@ class ReLoCLNet(nn.Module):
         hard_query_gates = baseline_scores.new_ones((hard_query_indices.numel(),))
         return hard_query_indices, hard_query_gates
 
+    @staticmethod
+    def _build_retrieval_details(
+        baseline_scores,
+        fused_scores,
+        hard_query_indices=None,
+        hard_query_gates=None,
+        rerank_topk=0,
+        active_score_weight=0.0,
+        late_residual_enabled=False,
+        top1_protected_count=0,
+    ):
+        num_query = baseline_scores.shape[0]
+        hard_mask = torch.zeros(num_query, device=baseline_scores.device, dtype=torch.bool)
+        hard_gates = baseline_scores.new_zeros((num_query,))
+        if hard_query_indices is not None and hard_query_indices.numel() > 0:
+            hard_mask[hard_query_indices] = True
+            if hard_query_gates is not None and hard_query_gates.numel() == hard_query_indices.numel():
+                hard_gates[hard_query_indices] = hard_query_gates
+            else:
+                hard_gates[hard_query_indices] = 1.0
+        return {
+            "baseline_scores": baseline_scores.detach(),
+            "late_delta_scores": (fused_scores - baseline_scores).detach(),
+            "hard_query_mask": hard_mask,
+            "hard_query_gates": hard_gates.detach(),
+            "rerank_topk": int(rerank_topk),
+            "active_score_weight": float(active_score_weight),
+            "late_residual_enabled": bool(late_residual_enabled),
+            "top1_protected_count": int(top1_protected_count),
+        }
+
     def _apply_late_residual_rerank(
         self,
         baseline_scores,
@@ -495,21 +534,62 @@ class ReLoCLNet(nn.Module):
         context_mask,
         late_context_feat,
         late_context_is_prepared=False,
+        return_details=False,
     ):
         if not self._is_late_residual_enabled():
+            if return_details:
+                return baseline_scores, self._build_retrieval_details(
+                    baseline_scores=baseline_scores,
+                    fused_scores=baseline_scores,
+                    rerank_topk=0,
+                    active_score_weight=0.0,
+                    late_residual_enabled=False,
+                )
             return baseline_scores
         active_score_weight = self._get_active_score_weight()
         if active_score_weight <= 0:
+            if return_details:
+                return baseline_scores, self._build_retrieval_details(
+                    baseline_scores=baseline_scores,
+                    fused_scores=baseline_scores,
+                    rerank_topk=0,
+                    active_score_weight=0.0,
+                    late_residual_enabled=False,
+                )
             return baseline_scores
         num_query, num_video = baseline_scores.shape
         if num_video == 0:
+            if return_details:
+                return baseline_scores, self._build_retrieval_details(
+                    baseline_scores=baseline_scores,
+                    fused_scores=baseline_scores,
+                    rerank_topk=0,
+                    active_score_weight=0.0,
+                    late_residual_enabled=False,
+                )
             return baseline_scores
         rerank_topk = self._get_active_rerank_topk(num_video)
         if rerank_topk <= 0:
+            if return_details:
+                return baseline_scores, self._build_retrieval_details(
+                    baseline_scores=baseline_scores,
+                    fused_scores=baseline_scores,
+                    rerank_topk=0,
+                    active_score_weight=0.0,
+                    late_residual_enabled=False,
+                )
             return baseline_scores
 
         hard_query_indices, hard_query_gates = self._select_rerank_queries(baseline_scores)
         if hard_query_indices.numel() == 0:
+            if return_details:
+                return baseline_scores, self._build_retrieval_details(
+                    baseline_scores=baseline_scores,
+                    fused_scores=baseline_scores,
+                    rerank_topk=rerank_topk,
+                    active_score_weight=active_score_weight,
+                    late_residual_enabled=False,
+                )
             return baseline_scores
 
         selected_baseline_scores = baseline_scores[hard_query_indices]
@@ -560,6 +640,16 @@ class ReLoCLNet(nn.Module):
         else:
             late_residual_term = late_topk_scores * rank_decay_factors.unsqueeze(0)
         fused_topk = topk_baseline_scores + active_score_weight * hard_query_gates.unsqueeze(1) * late_residual_term
+
+        top1_protected_count = 0
+        if self.late_interaction_preserve_baseline_top1 and rerank_topk > 0:
+            protected_top1 = torch.maximum(fused_topk[:, 0], topk_baseline_scores[:, 0])
+            if rerank_topk > 1:
+                competitor_floor = fused_topk[:, 1:].max(dim=1).values + self.late_interaction_preserve_top1_margin
+                protected_top1 = torch.maximum(protected_top1, competitor_floor)
+            top1_protected_count = int((protected_top1 > fused_topk[:, 0]).sum().item())
+            fused_topk[:, 0] = protected_top1
+
         fused_scores = baseline_scores.clone()
         if hard_query_indices.numel() == num_query:
             fused_scores.scatter_(1, topk_indices, fused_topk)
@@ -567,6 +657,17 @@ class ReLoCLNet(nn.Module):
             hard_query_scores = fused_scores[hard_query_indices]
             hard_query_scores.scatter_(1, topk_indices, fused_topk)
             fused_scores[hard_query_indices] = hard_query_scores
+        if return_details:
+            return fused_scores, self._build_retrieval_details(
+                baseline_scores=baseline_scores,
+                fused_scores=fused_scores,
+                hard_query_indices=hard_query_indices,
+                hard_query_gates=hard_query_gates,
+                rerank_topk=rerank_topk,
+                active_score_weight=active_score_weight,
+                late_residual_enabled=True,
+                top1_protected_count=top1_protected_count,
+            )
         return fused_scores
 
     def _get_retrieval_scores(
@@ -578,9 +679,18 @@ class ReLoCLNet(nn.Module):
         context_mask,
         late_context_feat=None,
         late_context_is_prepared=False,
+        return_details=False,
     ):
         baseline_scores = self.get_video_level_scores(video_query, context_feat, context_mask)
         if not self.use_late_residual:
+            if return_details:
+                return baseline_scores, self._build_retrieval_details(
+                    baseline_scores=baseline_scores,
+                    fused_scores=baseline_scores,
+                    rerank_topk=0,
+                    active_score_weight=0.0,
+                    late_residual_enabled=False,
+                )
             return baseline_scores
         if encoded_query is None:
             raise ValueError("encoded_query is required for retrieval_scorer={}".format(self.retrieval_scorer))
@@ -594,6 +704,7 @@ class ReLoCLNet(nn.Module):
             context_mask=context_mask,
             late_context_feat=late_context_feat,
             late_context_is_prepared=late_context_is_prepared,
+            return_details=return_details,
         )
 
     def score_queries_to_single_context(self, query_feat, query_mask, context_feat, context_mask):
@@ -651,6 +762,7 @@ class ReLoCLNet(nn.Module):
         return_query_feats=False,
         return_encoded_query=False,
         return_similarity=False,
+        return_retrieval_details=False,
     ):
         need_encoded_query = return_encoded_query or return_similarity or self.use_late_component
 
@@ -666,7 +778,7 @@ class ReLoCLNet(nn.Module):
         else:
             retrieval_context_is_prepared = self.use_late_component
 
-        q2ctx_scores = self._get_retrieval_scores(
+        retrieval_outputs = self._get_retrieval_scores(
             video_query=video_query,
             encoded_query=encoded_query,
             query_mask=query_mask,
@@ -674,7 +786,13 @@ class ReLoCLNet(nn.Module):
             context_mask=video_mask,
             late_context_feat=retrieval_context_feat,
             late_context_is_prepared=retrieval_context_is_prepared,
+            return_details=return_retrieval_details,
         )
+        if return_retrieval_details:
+            q2ctx_scores, retrieval_details = retrieval_outputs
+        else:
+            q2ctx_scores = retrieval_outputs
+            retrieval_details = None
         similarity = self.get_merged_score(video_query, video_feat, cross=cross)
         st_prob, ed_prob = self.get_merged_st_ed_prob(similarity, video_mask, cross=cross)
 
@@ -687,6 +805,8 @@ class ReLoCLNet(nn.Module):
         if return_similarity:
             temporal_curve = self.get_temporal_curve(encoded_query, query_mask, video_feat, video_mask)
             outputs.append(temporal_curve)
+        if return_retrieval_details:
+            outputs.append(retrieval_details)
         return tuple(outputs)
 
     def compute_lm_loss(self, input_ids, attention_mask, memory, memory_mask):

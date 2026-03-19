@@ -183,6 +183,12 @@ class BaseOptions(object):
         self.parser.add_argument("--late_interaction_rerank_soft_min_gate", type=float, default=0.0,
                                  help=("When soft gating is enabled, skip queries with gate <= this value. "
                                        "0 keeps all queries."))
+        self.parser.add_argument("--late_interaction_preserve_baseline_top1", action="store_true",
+                                 help=("Keep baseline top-1 video score as a floor after residual rerank. "
+                                       "Useful to protect VR recall from over-aggressive residual updates."))
+        self.parser.add_argument("--late_interaction_preserve_top1_margin", type=float, default=0.0,
+                                 help=("When preserving baseline top-1, enforce top1 >= max(other reranked)+margin. "
+                                       "0 keeps tie-level protection only."))
         self.parser.add_argument("--late_interaction_train_start_epoch", type=int, default=0,
                                  help="Enable late-interaction rerank in training starting from this epoch.")
         self.parser.add_argument("--late_interaction_train_score_weight", type=float, default=-1.0,
@@ -375,6 +381,13 @@ class BaseOptions(object):
                                        "1.0 keeps original behavior; lower values reduce video-score dominance."))
         self.parser.add_argument("--max_before_nms", type=int, default=200)
         self.parser.add_argument("--max_vcmr_video", type=int, default=100, help="re-ranking in top-max_vcmr_video")
+        self.parser.add_argument("--export_score_diagnostics", action="store_true",
+                                 help="Export per-query score diagnostics (baseline/fused/late/span terms) in eval.")
+        self.parser.add_argument("--score_diagnostics_topk", type=int, default=10,
+                                 help="How many top-ranked videos to keep per query in score diagnostics export.")
+        self.parser.add_argument("--score_diagnostics_filename", type=str, default="",
+                                 help=("Optional diagnostics filename. Empty means auto name based on submission file. "
+                                       "Saved under results_dir."))
         self.parser.add_argument("--nms_thd", type=float, default=-1,
                                  help="additionally use non-maximum suppression (or non-minimum suppression for "
                                       "distance) to post-processing the predictions. -1: do not use nms. 0.6 for "
@@ -406,7 +419,8 @@ class BaseOptions(object):
             for arg in saved_options:
                 if arg not in ["results_root", "num_workers", "nms_thd", "debug",
                                "eval_split_name", "eval_path", "eval_query_bsz", "eval_context_bsz",
-                               "max_pred_l", "min_pred_l", "external_inference_vr_res_path"]:
+                               "max_pred_l", "min_pred_l", "external_inference_vr_res_path",
+                               "export_score_diagnostics", "score_diagnostics_topk", "score_diagnostics_filename"]:
                     setattr(opt, arg, saved_options[arg])
         else:
             if opt.exp_id is None:
@@ -554,6 +568,8 @@ class BaseOptions(object):
             raise ValueError("--late_interaction_rerank_soft_temperature must be >= 0.")
         if not (0.0 <= opt.late_interaction_rerank_soft_min_gate <= 1.0):
             raise ValueError("--late_interaction_rerank_soft_min_gate must be in [0, 1].")
+        if opt.late_interaction_preserve_top1_margin < 0:
+            raise ValueError("--late_interaction_preserve_top1_margin must be >= 0.")
         if opt.late_interaction_train_start_epoch < 0:
             raise ValueError("--late_interaction_train_start_epoch must be >= 0.")
         if opt.late_interaction_train_score_weight < 0:
@@ -582,6 +598,8 @@ class BaseOptions(object):
             opt.q2c_alpha_vcmr = opt.q2c_alpha
         if opt.vcmr_video_score_weight <= 0:
             raise ValueError("--vcmr_video_score_weight must be > 0.")
+        if opt.score_diagnostics_topk <= 0:
+            raise ValueError("--score_diagnostics_topk must be > 0.")
         if opt.early_stop_min_delta < 0:
             raise ValueError("--early_stop_min_delta must be >= 0.")
         if opt.early_stop_vcmr_weight < 0 or opt.early_stop_svmr_weight < 0 or opt.early_stop_vr_weight < 0:

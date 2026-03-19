@@ -15,7 +15,7 @@ from method_tvr.config import TestOptions
 from method_tvr.model import ReLoCLNet
 from method_tvr.start_end_dataset import StartEndEvalDataset, prepare_batch_inputs, start_end_collate
 from standalone_eval.eval import eval_retrieval
-from utils.basic_utils import save_json
+from utils.basic_utils import save_json, save_jsonl
 from utils.temporal_nms import temporal_non_maximum_suppression
 from utils.tensor_utils import find_max_triples_from_upper_triangle_product
 
@@ -93,8 +93,8 @@ def get_submission_top_n(submission, top_n=100):
         return top_n_res
 
     top_n_submission = {"video2idx": submission["video2idx"]}
-    for task_name in submission:
-        if task_name != "video2idx":
+    for task_name in ("SVMR", "VCMR", "VR"):
+        if task_name in submission:
             top_n_submission[task_name] = get_prediction_top_n(submission[task_name], top_n)
     return top_n_submission
 
@@ -336,20 +336,31 @@ def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=10
     else:
         svmr_video2meta_idx, svmr_gt_st_probs, svmr_gt_ed_probs = None, None, None
 
+    collect_score_diagnostics = bool(getattr(opt, "export_score_diagnostics", False)) and (is_vr or is_vcmr)
+    diagnostics_topk = int(getattr(opt, "score_diagnostics_topk", 10))
+    diagnostics_topk = max(1, min(diagnostics_topk, max_n_videos))
+    score_diagnostics_rows = []
+
     query_metas = []
     for idx, batch in tqdm(enumerate(query_eval_loader), desc="Computing q embedding", total=len(query_eval_loader)):
         batch_query_metas = batch[0]
         query_metas.extend(batch_query_metas)
         model_inputs = prepare_batch_inputs(batch[1], device=opt.device, non_blocking=opt.pin_memory)
 
-        raw_query_context_scores, st_probs, ed_probs = model.get_pred_from_raw_query(
+        pred_outputs = model.get_pred_from_raw_query(
             model_inputs["query_feat"],
             model_inputs["query_mask"],
             ctx_info["video_feat"],
             ctx_info["video_mask"],
             retrieval_context_feat=ctx_info.get("video_retrieval_feat"),
             cross=True,
+            return_retrieval_details=collect_score_diagnostics,
         )
+        if collect_score_diagnostics:
+            raw_query_context_scores, st_probs, ed_probs, retrieval_details = pred_outputs
+        else:
+            raw_query_context_scores, st_probs, ed_probs = pred_outputs
+            retrieval_details = None
 
         query_context_scores = torch.exp(opt.q2c_alpha * raw_query_context_scores)
         st_probs = F.softmax(st_probs, dim=-1)
@@ -375,6 +386,40 @@ def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=10
         sorted_q2c_scores[idx * bsz:(idx + 1) * bsz] = sorted_scores.cpu().numpy()
 
         if not is_vcmr:
+            if collect_score_diagnostics:
+                baseline_raw_scores = retrieval_details["baseline_scores"]
+                late_delta_scores = retrieval_details["late_delta_scores"]
+                hard_query_mask = retrieval_details["hard_query_mask"]
+                hard_query_gates = retrieval_details["hard_query_gates"]
+                late_residual_enabled = bool(retrieval_details.get("late_residual_enabled", False))
+                rerank_topk_used = int(retrieval_details.get("rerank_topk", 0))
+                active_score_weight = float(retrieval_details.get("active_score_weight", 0.0))
+                for local_q, query_meta in enumerate(batch_query_metas):
+                    ranked_meta_indices = sorted_indices[local_q, :diagnostics_topk]
+                    fused_raw = raw_query_context_scores[local_q, ranked_meta_indices]
+                    baseline_raw = baseline_raw_scores[local_q, ranked_meta_indices]
+                    late_raw = late_delta_scores[local_q, ranked_meta_indices]
+                    fused_q2c = query_context_scores[local_q, ranked_meta_indices]
+                    for rank_j in range(diagnostics_topk):
+                        meta_idx = int(ranked_meta_indices[rank_j].item())
+                        vid_name = video_metas[meta_idx]["vid_name"]
+                        score_diagnostics_rows.append({
+                            "desc_id": int(query_meta["desc_id"]),
+                            "desc": query_meta["desc"],
+                            "rank": int(rank_j + 1),
+                            "video_meta_index": meta_idx,
+                            "vid_name": vid_name,
+                            "video_idx": int(video2idx[vid_name]),
+                            "fused_raw_score": float(fused_raw[rank_j].item()),
+                            "baseline_raw_score": float(baseline_raw[rank_j].item()),
+                            "late_delta_raw_score": float(late_raw[rank_j].item()),
+                            "fused_q2c_score": float(fused_q2c[rank_j].item()),
+                            "hard_query": bool(hard_query_mask[local_q].item()),
+                            "hard_query_gate": float(hard_query_gates[local_q].item()),
+                            "late_residual_enabled": late_residual_enabled,
+                            "rerank_topk": rerank_topk_used,
+                            "active_score_weight": active_score_weight,
+                        })
             continue
 
         row_indices = torch.arange(0, len(st_probs), device=opt.device).unsqueeze(1)
@@ -391,6 +436,8 @@ def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=10
         st_ed_scores = torch.einsum("qvm,qv,qvn->qvmn", st_probs_topk, vcmr_video_scores_topk, ed_probs_topk)
         valid_prob_mask = generate_min_max_length_mask(st_ed_scores.shape, min_l=opt.min_pred_l, max_l=opt.max_pred_l)
         st_ed_scores *= torch.from_numpy(valid_prob_mask).to(st_ed_scores.device)
+        best_vcmr_scores_topk = st_ed_scores.amax(dim=(2, 3))
+        best_span_scores_topk = best_vcmr_scores_topk / torch.clamp(vcmr_video_scores_topk, min=1e-8)
 
         n_q = st_ed_scores.shape[0]
         flat_st_ed_scores = st_ed_scores.reshape(n_q, -1)
@@ -398,6 +445,47 @@ def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=10
 
         flat_st_ed_sorted_scores[idx * bsz:(idx + 1) * bsz] = flat_scores[:, :max_before_nms].cpu().numpy()
         flat_st_ed_scores_sorted_indices[idx * bsz:(idx + 1) * bsz] = flat_indices[:, :max_before_nms].cpu().numpy()
+
+        if collect_score_diagnostics:
+            baseline_raw_scores = retrieval_details["baseline_scores"]
+            late_delta_scores = retrieval_details["late_delta_scores"]
+            hard_query_mask = retrieval_details["hard_query_mask"]
+            hard_query_gates = retrieval_details["hard_query_gates"]
+            late_residual_enabled = bool(retrieval_details.get("late_residual_enabled", False))
+            rerank_topk_used = int(retrieval_details.get("rerank_topk", 0))
+            active_score_weight = float(retrieval_details.get("active_score_weight", 0.0))
+            for local_q, query_meta in enumerate(batch_query_metas):
+                ranked_meta_indices = sorted_indices[local_q, :diagnostics_topk]
+                fused_raw = raw_query_context_scores[local_q, ranked_meta_indices]
+                baseline_raw = baseline_raw_scores[local_q, ranked_meta_indices]
+                late_raw = late_delta_scores[local_q, ranked_meta_indices]
+                fused_q2c = query_context_scores[local_q, ranked_meta_indices]
+                video_term = vcmr_video_scores_topk[local_q, :diagnostics_topk]
+                best_vcmr_term = best_vcmr_scores_topk[local_q, :diagnostics_topk]
+                best_span_term = best_span_scores_topk[local_q, :diagnostics_topk]
+                for rank_j in range(diagnostics_topk):
+                    meta_idx = int(ranked_meta_indices[rank_j].item())
+                    vid_name = video_metas[meta_idx]["vid_name"]
+                    score_diagnostics_rows.append({
+                        "desc_id": int(query_meta["desc_id"]),
+                        "desc": query_meta["desc"],
+                        "rank": int(rank_j + 1),
+                        "video_meta_index": meta_idx,
+                        "vid_name": vid_name,
+                        "video_idx": int(video2idx[vid_name]),
+                        "fused_raw_score": float(fused_raw[rank_j].item()),
+                        "baseline_raw_score": float(baseline_raw[rank_j].item()),
+                        "late_delta_raw_score": float(late_raw[rank_j].item()),
+                        "fused_q2c_score": float(fused_q2c[rank_j].item()),
+                        "vcmr_video_score_term": float(video_term[rank_j].item()),
+                        "best_vcmr_score": float(best_vcmr_term[rank_j].item()),
+                        "best_span_score": float(best_span_term[rank_j].item()),
+                        "hard_query": bool(hard_query_mask[local_q].item()),
+                        "hard_query_gate": float(hard_query_gates[local_q].item()),
+                        "late_residual_enabled": late_residual_enabled,
+                        "rerank_topk": rerank_topk_used,
+                        "active_score_weight": active_score_weight,
+                    })
 
         if opt.debug:
             break
@@ -475,7 +563,10 @@ def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=10
             })
 
     results = {"SVMR": svmr_res, "VCMR": vcmr_res, "VR": vr_res}
-    return {k: v for k, v in results.items() if len(v) != 0}
+    filtered_results = {k: v for k, v in results.items() if len(v) != 0}
+    if collect_score_diagnostics and score_diagnostics_rows:
+        filtered_results["__score_diagnostics__"] = score_diagnostics_rows
+    return filtered_results
 
 
 def get_eval_res(model, eval_dataset, opt, tasks):
@@ -514,6 +605,7 @@ def eval_epoch(model, eval_dataset, opt, save_submission_filename, tasks=("SVMR"
     logger.info("Computing scores")
     st_time = time.time()
     eval_submission_raw = get_eval_res(model, eval_dataset, opt, tasks)
+    score_diagnostics_rows = eval_submission_raw.pop("__score_diagnostics__", None)
     total_time = time.time() - st_time
     print("\n" + "\x1b[1;31m" + str(total_time) + "\x1b[0m", flush=True)
 
@@ -539,6 +631,18 @@ def eval_epoch(model, eval_dataset, opt, save_submission_filename, tasks=("SVMR"
     else:
         metrics = None
         latest_file_paths = [submission_path]
+
+    if score_diagnostics_rows is not None:
+        configured_diag_name = str(getattr(opt, "score_diagnostics_filename", "")).strip()
+        if not configured_diag_name:
+            configured_diag_name = save_submission_filename.replace(".json", "_score_diagnostics.jsonl")
+        if os.path.isabs(configured_diag_name):
+            score_diag_path = configured_diag_name
+        else:
+            score_diag_path = os.path.join(opt.results_dir, configured_diag_name)
+        save_jsonl(score_diagnostics_rows, score_diag_path)
+        latest_file_paths.append(score_diag_path)
+        logger.info("Saved score diagnostics to %s (%d rows)", score_diag_path, len(score_diagnostics_rows))
 
     if opt.nms_thd != -1:
         logger.info("Performing NMS with threshold %s", opt.nms_thd)
