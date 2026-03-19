@@ -26,6 +26,13 @@ VERIFIED_ROOT="${VERIFIED_ROOT:-/data/VERIFIED_FIG_2024}"
 FIG_ANNO_ROOT="${FIG_ANNO_ROOT:-${VERIFIED_ROOT}/VERIFIED/fine-grained-anno}"
 FIG_FEAT_ROOT="${FIG_FEAT_ROOT:-${VERIFIED_ROOT}/features/VERIFIED_features/VERIFIED}"
 
+# Keep tokenizer/text-encoder defaults aligned with RoBERTa-based FIG features.
+# Users can still override these by passing the same flags in extra args.
+extra_args+=(--tokenizer_name_or_path)
+extra_args+=(roberta-base)
+extra_args+=(--semantic_text_encoder_name_or_path)
+extra_args+=(roberta-base)
+
 case ${dset_name} in
     tvr)
         train_path=data/tvr_train_release.jsonl

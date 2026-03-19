@@ -17,7 +17,7 @@ def main():
     parser.add_argument("--output_h5", type=str, required=True)
     parser.add_argument("--text_key", type=str, default="fig_desc")
     parser.add_argument("--id_key", type=str, default="desc_id")
-    parser.add_argument("--tokenizer", type=str, default="bert-base-uncased")
+    parser.add_argument("--tokenizer", type=str, default="roberta-base")
     parser.add_argument("--max_len", type=int, default=30)
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()

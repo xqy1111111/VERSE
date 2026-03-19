@@ -229,7 +229,7 @@ class BaseOptions(object):
         self.parser.add_argument("--fusion_num_layers", type=int, default=2,
                                  help="number of fusion encoder layers")
         self.parser.add_argument("--lm_weight", type=float, default=0.3, help="weight for LM loss")
-        self.parser.add_argument("--tokenizer_name_or_path", type=str, default="bert-base-uncased")
+        self.parser.add_argument("--tokenizer_name_or_path", type=str, default="roberta-base")
         self.parser.add_argument("--lm_max_len", type=int, default=30, help="max length for LM inputs")
         self.parser.add_argument("--lm_start_token", type=str, default="[DEC]",
                                  help="start token for the decoder input sequence")
@@ -308,7 +308,7 @@ class BaseOptions(object):
         self.parser.add_argument("--semantic_use_consistency_loss", action="store_true",
                                  help="Enable Semantic consistency loss.")
         self.parser.add_argument("--semantic_consistency_weight", type=float, default=1.0)
-        self.parser.add_argument("--semantic_text_encoder_name_or_path", type=str, default="bert-base-uncased",
+        self.parser.add_argument("--semantic_text_encoder_name_or_path", type=str, default="roberta-base",
                                  help="Text encoder for perturbation query features (Semantic only).")
 
         # Compositional supervision (rewrite-aware training on top of the main objective).
