@@ -65,3 +65,25 @@ def compute_consistency_loss(anchor_scores: torch.Tensor, pos_scores_per_sample:
     if count == 0:
         return anchor_scores.new_tensor(0.0)
     return total / float(count)
+
+
+def compute_debiased_correction_loss(
+    anchor_scores: torch.Tensor,
+    neg_scores_per_sample: List[torch.Tensor],
+    debias_weights_per_sample: List[torch.Tensor],
+) -> torch.Tensor:
+    """Pull near-positive negatives closer to anchor scores with a lightweight correction term."""
+    total = anchor_scores.new_tensor(0.0)
+    count = 0
+    for idx, anchor_score in enumerate(anchor_scores):
+        neg_scores = neg_scores_per_sample[idx]
+        debias_weights = debias_weights_per_sample[idx]
+        if neg_scores.numel() == 0 or debias_weights.numel() == 0:
+            continue
+        if neg_scores.numel() != debias_weights.numel():
+            continue
+        total = total + torch.sum((anchor_score - neg_scores).pow(2) * debias_weights)
+        count += int(torch.sum(debias_weights > 0).item())
+    if count == 0:
+        return anchor_scores.new_tensor(0.0)
+    return total / float(count)

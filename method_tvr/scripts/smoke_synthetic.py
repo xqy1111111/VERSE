@@ -37,8 +37,15 @@ def build_config(args):
         late_interaction_token_weight_floor=args.late_interaction_token_weight_floor,
         late_interaction_score_reduction=args.late_interaction_score_reduction,
         late_interaction_video_chunk_size=32,
-        combined_retrieval_alpha=args.combined_retrieval_alpha,
-        combined_retrieval_normalize=args.combined_retrieval_normalize,
+        late_interaction_rerank_topk=args.late_interaction_rerank_topk,
+        late_interaction_query_chunk_size=args.late_interaction_query_chunk_size,
+        late_interaction_score_weight=args.late_interaction_score_weight,
+        late_interaction_score_normalize=args.late_interaction_score_normalize,
+        late_interaction_apply_to_vcl=args.late_interaction_apply_to_vcl,
+        multi_vector_query_max_count=args.multi_vector_query_max_count,
+        multi_vector_phrase_window=args.multi_vector_phrase_window,
+        multi_vector_use_phrase_pooling=not args.multi_vector_disable_phrase_pooling,
+        multi_vector_use_global_fallback=not args.multi_vector_no_global_fallback,
         use_generative_augmentation=args.use_generative_augmentation,
         use_fusion_encoder=args.use_fusion_encoder or args.use_generative_augmentation,
         fusion_num_layers=2,
@@ -58,15 +65,22 @@ def main():
     parser.add_argument("--backbone_type", type=str, default="Transformer",
                         choices=["Transformer", "BiMamba"])
     parser.add_argument("--retrieval_scorer", type=str, default="single_vector",
-                        choices=["single_vector", "late_interaction", "combined"])
+                        choices=["single_vector", "residual_rerank", "late_interaction", "combined"])
     parser.add_argument("--late_interaction_no_projection", action="store_true")
     parser.add_argument("--late_interaction_use_token_weight", action="store_true")
     parser.add_argument("--late_interaction_token_weight_floor", type=float, default=0.0)
     parser.add_argument("--late_interaction_score_reduction", type=str, default="mean",
                         choices=["sum", "mean"])
-    parser.add_argument("--combined_retrieval_alpha", type=float, default=0.5)
-    parser.add_argument("--combined_retrieval_normalize", type=str, default="zscore",
+    parser.add_argument("--late_interaction_rerank_topk", type=int, default=4)
+    parser.add_argument("--late_interaction_query_chunk_size", type=int, default=2)
+    parser.add_argument("--late_interaction_score_weight", type=float, default=0.2)
+    parser.add_argument("--late_interaction_score_normalize", type=str, default="zscore",
                         choices=["none", "zscore", "minmax"])
+    parser.add_argument("--late_interaction_apply_to_vcl", action="store_true")
+    parser.add_argument("--multi_vector_query_max_count", type=int, default=4)
+    parser.add_argument("--multi_vector_phrase_window", type=int, default=1)
+    parser.add_argument("--multi_vector_disable_phrase_pooling", action="store_true")
+    parser.add_argument("--multi_vector_no_global_fallback", action="store_true")
     parser.add_argument("--use_generative_augmentation", action="store_true")
     parser.add_argument("--use_fusion_encoder", action="store_true")
     args = parser.parse_args()

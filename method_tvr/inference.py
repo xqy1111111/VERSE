@@ -342,7 +342,7 @@ def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=10
         query_metas.extend(batch_query_metas)
         model_inputs = prepare_batch_inputs(batch[1], device=opt.device, non_blocking=opt.pin_memory)
 
-        query_context_scores, st_probs, ed_probs = model.get_pred_from_raw_query(
+        raw_query_context_scores, st_probs, ed_probs = model.get_pred_from_raw_query(
             model_inputs["query_feat"],
             model_inputs["query_mask"],
             ctx_info["video_feat"],
@@ -351,7 +351,7 @@ def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=10
             cross=True,
         )
 
-        query_context_scores = torch.exp(opt.q2c_alpha * query_context_scores)
+        query_context_scores = torch.exp(opt.q2c_alpha * raw_query_context_scores)
         st_probs = F.softmax(st_probs, dim=-1)
         ed_probs = F.softmax(ed_probs, dim=-1)
 
@@ -380,8 +380,15 @@ def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=10
         row_indices = torch.arange(0, len(st_probs), device=opt.device).unsqueeze(1)
         st_probs_topk = st_probs[row_indices, sorted_indices]
         ed_probs_topk = ed_probs[row_indices, sorted_indices]
+        raw_scores_topk = raw_query_context_scores[row_indices, sorted_indices]
+        vcmr_video_scores_topk = torch.exp(opt.q2c_alpha_vcmr * raw_scores_topk)
+        if opt.vcmr_video_score_weight != 1.0:
+            vcmr_video_scores_topk = torch.pow(
+                torch.clamp(vcmr_video_scores_topk, min=1e-8),
+                opt.vcmr_video_score_weight,
+            )
 
-        st_ed_scores = torch.einsum("qvm,qv,qvn->qvmn", st_probs_topk, sorted_scores, ed_probs_topk)
+        st_ed_scores = torch.einsum("qvm,qv,qvn->qvmn", st_probs_topk, vcmr_video_scores_topk, ed_probs_topk)
         valid_prob_mask = generate_min_max_length_mask(st_ed_scores.shape, min_l=opt.min_pred_l, max_l=opt.max_pred_l)
         st_ed_scores *= torch.from_numpy(valid_prob_mask).to(st_ed_scores.device)
 

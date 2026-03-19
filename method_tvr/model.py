@@ -96,20 +96,85 @@ class ReLoCLNet(nn.Module):
         self.lm_pad_token_id = getattr(config, "lm_pad_token_id", 0)
         self.use_fusion_encoder = getattr(config, "use_fusion_encoder", False)
         self.fusion_num_layers = getattr(config, "fusion_num_layers", 2)
-        self.retrieval_scorer = getattr(config, "retrieval_scorer", "single_vector")
-        if self.retrieval_scorer not in {"single_vector", "late_interaction", "combined"}:
-            raise ValueError("retrieval_scorer must be one of {'single_vector', 'late_interaction', 'combined'}")
-        self.use_late_interaction = self.retrieval_scorer == "late_interaction"
-        self.use_combined_retrieval = self.retrieval_scorer == "combined"
-        self.use_late_component = self.retrieval_scorer in {"late_interaction", "combined"}
-        self.combined_retrieval_alpha = float(getattr(config, "combined_retrieval_alpha", 0.5))
-        self.combined_retrieval_normalize = str(getattr(config, "combined_retrieval_normalize", "zscore"))
-        if self.combined_retrieval_normalize not in {"none", "zscore", "minmax"}:
-            raise ValueError("combined_retrieval_normalize must be one of {'none', 'zscore', 'minmax'}")
-        if not (0.0 <= self.combined_retrieval_alpha <= 1.0):
-            raise ValueError("combined_retrieval_alpha must be in [0, 1]")
+        retrieval_scorer = getattr(config, "retrieval_scorer", "single_vector")
+        if retrieval_scorer in {"late_interaction", "combined"}:
+            retrieval_scorer = "residual_rerank"
+        self.retrieval_scorer = retrieval_scorer
+        if self.retrieval_scorer not in {"single_vector", "residual_rerank"}:
+            raise ValueError("retrieval_scorer must be one of {'single_vector', 'residual_rerank'}")
+        self.use_late_residual = self.retrieval_scorer == "residual_rerank"
+        self.use_late_component = self.use_late_residual
+        self.use_late_interaction = self.use_late_residual
 
-        if self.use_late_component:
+        self.late_interaction_rerank_topk = int(getattr(config, "late_interaction_rerank_topk", 50))
+        self.late_interaction_train_rerank_topk = int(
+            getattr(config, "late_interaction_train_rerank_topk", self.late_interaction_rerank_topk)
+        )
+        self.late_interaction_eval_rerank_topk = int(
+            getattr(config, "late_interaction_eval_rerank_topk", self.late_interaction_rerank_topk)
+        )
+        self.late_interaction_query_chunk_size = int(getattr(config, "late_interaction_query_chunk_size", 4))
+        self.late_interaction_rerank_margin_threshold = float(
+            getattr(config, "late_interaction_rerank_margin_threshold", -1.0)
+        )
+        self.late_interaction_rerank_soft_temperature = float(
+            getattr(config, "late_interaction_rerank_soft_temperature", 0.0)
+        )
+        self.late_interaction_rerank_soft_min_gate = float(
+            getattr(config, "late_interaction_rerank_soft_min_gate", 0.0)
+        )
+        self.late_interaction_train_start_epoch = int(getattr(config, "late_interaction_train_start_epoch", 0))
+        self.late_interaction_residual_clip = float(getattr(config, "late_interaction_residual_clip", -1.0))
+        self.late_interaction_rank_head_weight = float(getattr(config, "late_interaction_rank_head_weight", 1.0))
+        self.late_interaction_rank_gamma = float(getattr(config, "late_interaction_rank_gamma", 1.0))
+        self.late_interaction_detach_backbone_in_train = bool(
+            getattr(config, "late_interaction_detach_backbone_in_train", False)
+        )
+        self.late_interaction_score_weight = float(getattr(config, "late_interaction_score_weight", 0.2))
+        self.late_interaction_train_score_weight = float(
+            getattr(config, "late_interaction_train_score_weight", self.late_interaction_score_weight)
+        )
+        self.late_interaction_eval_score_weight = float(
+            getattr(config, "late_interaction_eval_score_weight", self.late_interaction_score_weight)
+        )
+        self.late_interaction_train_score_warmup_epochs = int(
+            getattr(config, "late_interaction_train_score_warmup_epochs", 0)
+        )
+        self.late_interaction_score_normalize = str(getattr(config, "late_interaction_score_normalize", "zscore"))
+        self.late_interaction_apply_to_vcl = bool(getattr(config, "late_interaction_apply_to_vcl", False))
+        self.current_train_epoch = 0
+        if self.late_interaction_score_normalize not in {"none", "zscore", "minmax"}:
+            raise ValueError("late_interaction_score_normalize must be one of {'none', 'zscore', 'minmax'}")
+        if self.late_interaction_rerank_topk < 0:
+            raise ValueError("late_interaction_rerank_topk must be >= 0")
+        if self.late_interaction_train_rerank_topk < 0:
+            raise ValueError("late_interaction_train_rerank_topk must be >= 0")
+        if self.late_interaction_eval_rerank_topk < 0:
+            raise ValueError("late_interaction_eval_rerank_topk must be >= 0")
+        if self.late_interaction_query_chunk_size <= 0:
+            raise ValueError("late_interaction_query_chunk_size must be > 0")
+        if self.late_interaction_train_start_epoch < 0:
+            raise ValueError("late_interaction_train_start_epoch must be >= 0")
+        if self.late_interaction_rerank_margin_threshold < 0:
+            self.late_interaction_rerank_margin_threshold = -1.0
+        if self.late_interaction_rerank_soft_temperature < 0:
+            raise ValueError("late_interaction_rerank_soft_temperature must be >= 0")
+        if not (0.0 <= self.late_interaction_rerank_soft_min_gate <= 1.0):
+            raise ValueError("late_interaction_rerank_soft_min_gate must be in [0, 1]")
+        if not (0.0 <= self.late_interaction_score_weight <= 1.0):
+            raise ValueError("late_interaction_score_weight must be in [0, 1]")
+        if not (0.0 <= self.late_interaction_train_score_weight <= 1.0):
+            raise ValueError("late_interaction_train_score_weight must be in [0, 1]")
+        if not (0.0 <= self.late_interaction_eval_score_weight <= 1.0):
+            raise ValueError("late_interaction_eval_score_weight must be in [0, 1]")
+        if not (0.0 < self.late_interaction_rank_head_weight <= 1.0):
+            raise ValueError("late_interaction_rank_head_weight must be in (0, 1]")
+        if self.late_interaction_rank_gamma <= 0:
+            raise ValueError("late_interaction_rank_gamma must be > 0")
+        if self.late_interaction_train_score_warmup_epochs < 0:
+            raise ValueError("late_interaction_train_score_warmup_epochs must be >= 0")
+
+        if self.use_late_residual:
             self.late_interaction_retriever = LateInteractionRetriever(
                 hidden_size=config.hidden_size,
                 interaction_dim=getattr(config, "late_interaction_dim", config.hidden_size),
@@ -118,6 +183,10 @@ class ReLoCLNet(nn.Module):
                 token_weight_floor=getattr(config, "late_interaction_token_weight_floor", 0.0),
                 score_reduction=getattr(config, "late_interaction_score_reduction", "mean"),
                 video_chunk_size=getattr(config, "late_interaction_video_chunk_size", 256),
+                multi_vector_query_max_count=getattr(config, "multi_vector_query_max_count", 6),
+                multi_vector_phrase_window=getattr(config, "multi_vector_phrase_window", 1),
+                multi_vector_use_phrase_pooling=getattr(config, "multi_vector_use_phrase_pooling", True),
+                multi_vector_use_global_fallback=getattr(config, "multi_vector_use_global_fallback", True),
             )
         else:
             self.late_interaction_retriever = None
@@ -194,6 +263,9 @@ class ReLoCLNet(nn.Module):
     def set_train_st_ed(self, lw_st_ed):
         self.config.lw_st_ed = lw_st_ed
 
+    def set_train_epoch(self, epoch_i):
+        self.current_train_epoch = int(epoch_i)
+
     def forward(
         self,
         query_feat,
@@ -229,7 +301,7 @@ class ReLoCLNet(nn.Module):
 
         loss_vcl = 0
         if self.config.lw_vcl != 0:
-            if self.retrieval_scorer != "single_vector":
+            if self.retrieval_scorer != "single_vector" and self.late_interaction_apply_to_vcl:
                 mid_video_q2ctx_scores = self._get_retrieval_scores(
                     video_query=video_query,
                     encoded_query=encoded_query,
@@ -333,24 +405,169 @@ class ReLoCLNet(nn.Module):
         query_context_scores = mask_logits(query_context_scores, context_mask)
         return query_context_scores
 
-    def _normalize_retrieval_scores(self, scores):
-        if self.combined_retrieval_normalize == "none":
+    def _normalize_late_residual_scores(self, scores):
+        if self.late_interaction_score_normalize == "none":
             return scores
-        if self.combined_retrieval_normalize == "zscore":
+        if self.late_interaction_score_normalize == "zscore":
             mean = scores.mean(dim=1, keepdim=True)
             std = scores.std(dim=1, keepdim=True, unbiased=False).clamp(min=1e-6)
             return (scores - mean) / std
-        if self.combined_retrieval_normalize == "minmax":
+        if self.late_interaction_score_normalize == "minmax":
             min_v = scores.min(dim=1, keepdim=True).values
             max_v = scores.max(dim=1, keepdim=True).values
             denom = (max_v - min_v).clamp(min=1e-6)
             return (scores - min_v) / denom
-        raise ValueError("Unsupported combined_retrieval_normalize: {}".format(self.combined_retrieval_normalize))
+        raise ValueError("Unsupported late_interaction_score_normalize: {}".format(self.late_interaction_score_normalize))
+
+    def _build_rank_decay_factors(self, rerank_topk, device, dtype):
+        if rerank_topk <= 0 or self.late_interaction_rank_head_weight >= 1.0:
+            return None
+        if rerank_topk == 1:
+            return torch.full((1,), self.late_interaction_rank_head_weight, device=device, dtype=dtype)
+        rank_pos = torch.arange(rerank_topk, device=device, dtype=dtype) / float(rerank_topk - 1)
+        return self.late_interaction_rank_head_weight + (1.0 - self.late_interaction_rank_head_weight) * (
+            rank_pos ** self.late_interaction_rank_gamma
+        )
 
     def encode_retrieval_context(self, context_feat):
-        if self.use_late_component:
+        if self.use_late_residual:
             return self.late_interaction_retriever.prepare_context_vectors(context_feat)
         return context_feat
+
+    def _get_active_rerank_topk(self, num_video):
+        configured_topk = (
+            self.late_interaction_train_rerank_topk if self.training else self.late_interaction_eval_rerank_topk
+        )
+        return min(configured_topk, num_video)
+
+    def _get_active_score_weight(self):
+        active_weight = self.late_interaction_train_score_weight if self.training else self.late_interaction_eval_score_weight
+        if self.training and self.late_interaction_train_score_warmup_epochs > 0:
+            warmup_start = self.late_interaction_train_start_epoch
+            if self.current_train_epoch >= warmup_start:
+                warmup_step = self.current_train_epoch - warmup_start + 1
+                warmup_progress = min(1.0, warmup_step / float(self.late_interaction_train_score_warmup_epochs))
+                active_weight = active_weight * warmup_progress
+        return active_weight
+
+    def _is_late_residual_enabled(self):
+        if not self.use_late_residual:
+            return False
+        if self.training and self.current_train_epoch < self.late_interaction_train_start_epoch:
+            return False
+        return True
+
+    def _select_rerank_queries(self, baseline_scores):
+        margin_threshold = self.late_interaction_rerank_margin_threshold
+        num_query, num_video = baseline_scores.shape
+        if num_query == 0:
+            empty = torch.empty(0, device=baseline_scores.device, dtype=torch.long)
+            empty_gate = baseline_scores.new_zeros((0,))
+            return empty, empty_gate
+        if margin_threshold < 0 or num_video < 2:
+            all_indices = torch.arange(num_query, device=baseline_scores.device, dtype=torch.long)
+            all_gates = baseline_scores.new_ones((num_query,))
+            return all_indices, all_gates
+
+        top2_values = torch.topk(baseline_scores, k=2, dim=1, largest=True).values
+        margins = top2_values[:, 0] - top2_values[:, 1]
+
+        if self.late_interaction_rerank_soft_temperature > 0:
+            temperature = max(self.late_interaction_rerank_soft_temperature, 1e-6)
+            soft_gates = torch.sigmoid((margin_threshold - margins) / temperature)
+            if self.late_interaction_rerank_soft_min_gate > 0:
+                selected_mask = soft_gates > self.late_interaction_rerank_soft_min_gate
+                selected_indices = torch.nonzero(selected_mask, as_tuple=False).squeeze(1)
+                return selected_indices, soft_gates[selected_indices]
+            selected_indices = torch.arange(num_query, device=baseline_scores.device, dtype=torch.long)
+            return selected_indices, soft_gates
+
+        hard_query_mask = margins <= margin_threshold
+        hard_query_indices = torch.nonzero(hard_query_mask, as_tuple=False).squeeze(1)
+        hard_query_gates = baseline_scores.new_ones((hard_query_indices.numel(),))
+        return hard_query_indices, hard_query_gates
+
+    def _apply_late_residual_rerank(
+        self,
+        baseline_scores,
+        encoded_query,
+        query_mask,
+        context_mask,
+        late_context_feat,
+        late_context_is_prepared=False,
+    ):
+        if not self._is_late_residual_enabled():
+            return baseline_scores
+        active_score_weight = self._get_active_score_weight()
+        if active_score_weight <= 0:
+            return baseline_scores
+        num_query, num_video = baseline_scores.shape
+        if num_video == 0:
+            return baseline_scores
+        rerank_topk = self._get_active_rerank_topk(num_video)
+        if rerank_topk <= 0:
+            return baseline_scores
+
+        hard_query_indices, hard_query_gates = self._select_rerank_queries(baseline_scores)
+        if hard_query_indices.numel() == 0:
+            return baseline_scores
+
+        selected_baseline_scores = baseline_scores[hard_query_indices]
+        late_query_input = encoded_query
+        late_context_input = late_context_feat
+        if self.training and self.late_interaction_detach_backbone_in_train:
+            late_query_input = late_query_input.detach()
+            late_context_input = late_context_input.detach()
+        topk_baseline_scores, topk_indices = torch.topk(selected_baseline_scores, k=rerank_topk, dim=1, largest=True)
+        prepared_query, prepared_query_mask, prepared_query_weights = self.late_interaction_retriever.prepare_query_vectors(
+            late_query_input[hard_query_indices],
+            query_mask[hard_query_indices],
+            return_details=False,
+        )
+        if not late_context_is_prepared:
+            prepared_late_context = self.late_interaction_retriever.prepare_context_vectors(late_context_input)
+        else:
+            prepared_late_context = late_context_input
+        late_topk_scores = topk_baseline_scores.new_zeros(topk_baseline_scores.shape)
+        query_chunk_size = self.late_interaction_query_chunk_size
+        num_hard_query = hard_query_indices.numel()
+        for query_start in range(0, num_hard_query, query_chunk_size):
+            query_end = min(query_start + query_chunk_size, num_hard_query)
+            chunk_indices = topk_indices[query_start:query_end]
+            candidate_context = prepared_late_context[chunk_indices]
+            candidate_context_mask = context_mask[chunk_indices]
+            late_topk_scores[query_start:query_end] = self.late_interaction_retriever.score_selected_prepared(
+                query_vectors=prepared_query[query_start:query_end],
+                query_vector_mask=prepared_query_mask[query_start:query_end],
+                query_vector_weights=prepared_query_weights[query_start:query_end],
+                context_mask=candidate_context_mask,
+                context_vectors=candidate_context,
+            )
+
+        late_topk_scores = self._normalize_late_residual_scores(late_topk_scores)
+        if self.late_interaction_residual_clip > 0:
+            late_topk_scores = late_topk_scores.clamp(
+                min=-self.late_interaction_residual_clip,
+                max=self.late_interaction_residual_clip,
+            )
+        rank_decay_factors = self._build_rank_decay_factors(
+            rerank_topk=rerank_topk,
+            device=late_topk_scores.device,
+            dtype=late_topk_scores.dtype,
+        )
+        if rank_decay_factors is None:
+            late_residual_term = late_topk_scores
+        else:
+            late_residual_term = late_topk_scores * rank_decay_factors.unsqueeze(0)
+        fused_topk = topk_baseline_scores + active_score_weight * hard_query_gates.unsqueeze(1) * late_residual_term
+        fused_scores = baseline_scores.clone()
+        if hard_query_indices.numel() == num_query:
+            fused_scores.scatter_(1, topk_indices, fused_topk)
+        else:
+            hard_query_scores = fused_scores[hard_query_indices]
+            hard_query_scores.scatter_(1, topk_indices, fused_topk)
+            fused_scores[hard_query_indices] = hard_query_scores
+        return fused_scores
 
     def _get_retrieval_scores(
         self,
@@ -362,27 +579,22 @@ class ReLoCLNet(nn.Module):
         late_context_feat=None,
         late_context_is_prepared=False,
     ):
-        if self.use_late_component:
-            if encoded_query is None:
-                raise ValueError("encoded_query is required for retrieval_scorer={}".format(self.retrieval_scorer))
-            if late_context_feat is None:
-                late_context_feat = context_feat
-                late_context_is_prepared = False
-            late_scores = self.late_interaction_retriever(
-                query_vectors=encoded_query,
-                query_mask=query_mask,
-                context_vectors=late_context_feat,
-                context_mask=context_mask,
-                context_is_prepared=late_context_is_prepared,
-            )
-            if self.use_late_interaction:
-                return late_scores
-            single_scores = self.get_video_level_scores(video_query, context_feat, context_mask)
-            single_scores = self._normalize_retrieval_scores(single_scores)
-            late_scores = self._normalize_retrieval_scores(late_scores)
-            alpha = self.combined_retrieval_alpha
-            return (1.0 - alpha) * single_scores + alpha * late_scores
-        return self.get_video_level_scores(video_query, context_feat, context_mask)
+        baseline_scores = self.get_video_level_scores(video_query, context_feat, context_mask)
+        if not self.use_late_residual:
+            return baseline_scores
+        if encoded_query is None:
+            raise ValueError("encoded_query is required for retrieval_scorer={}".format(self.retrieval_scorer))
+        if late_context_feat is None:
+            late_context_feat = context_feat
+            late_context_is_prepared = False
+        return self._apply_late_residual_rerank(
+            baseline_scores=baseline_scores,
+            encoded_query=encoded_query,
+            query_mask=query_mask,
+            context_mask=context_mask,
+            late_context_feat=late_context_feat,
+            late_context_is_prepared=late_context_is_prepared,
+        )
 
     def score_queries_to_single_context(self, query_feat, query_mask, context_feat, context_mask):
         if context_feat.size(0) != 1:

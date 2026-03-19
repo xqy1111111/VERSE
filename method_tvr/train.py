@@ -38,8 +38,82 @@ def set_seed(seed, use_cuda=True):
         torch.cuda.manual_seed_all(seed)
 
 
+def _safe_metric_sum(task_metrics, metric_names):
+    return float(sum(float(task_metrics.get(metric_name, 0.0)) for metric_name in metric_names))
+
+
+def _get_early_stop_metric_names(opt, task_name):
+    task_to_opt = {
+        "VCMR": ("early_stop_vcmr_metrics", ["0.5-r1", "0.7-r1"]),
+        "SVMR": ("early_stop_svmr_metrics", ["0.5-r1", "0.7-r1"]),
+        "VR": ("early_stop_vr_metrics", ["r1"]),
+    }
+    attr_name, default_metrics = task_to_opt[task_name]
+    metric_names = getattr(opt, attr_name, default_metrics)
+    if metric_names is None:
+        return list(default_metrics)
+    if isinstance(metric_names, str):
+        metric_names = [metric_names]
+    metric_names = [str(metric_name).strip() for metric_name in metric_names if str(metric_name).strip()]
+    return metric_names if metric_names else list(default_metrics)
+
+
+def _compute_stop_score(metrics, opt):
+    if getattr(opt, "early_stop_use_composite", False):
+        vcmr_metric_names = _get_early_stop_metric_names(opt, "VCMR")
+        svmr_metric_names = _get_early_stop_metric_names(opt, "SVMR")
+        vr_metric_names = _get_early_stop_metric_names(opt, "VR")
+
+        vcmr_score = _safe_metric_sum(metrics.get("VCMR", {}), vcmr_metric_names)
+        svmr_score = _safe_metric_sum(metrics.get("SVMR", {}), svmr_metric_names)
+        vr_score = _safe_metric_sum(metrics.get("VR", {}), vr_metric_names)
+        if getattr(opt, "early_stop_normalize_components", False):
+            vcmr_score = vcmr_score / float(opt.early_stop_vcmr_scale)
+            svmr_score = svmr_score / float(opt.early_stop_svmr_scale)
+            vr_score = vr_score / float(opt.early_stop_vr_scale)
+        stop_score = (
+            opt.early_stop_vcmr_weight * vcmr_score
+            + opt.early_stop_svmr_weight * svmr_score
+            + opt.early_stop_vr_weight * vr_score
+        )
+        if getattr(opt, "early_stop_normalize_components", False):
+            stop_desc = (
+                "composite_norm("
+                f"vcmr/{opt.early_stop_vcmr_scale},"
+                f"svmr/{opt.early_stop_svmr_scale},"
+                f"vr/{opt.early_stop_vr_scale})"
+            )
+        else:
+            stop_desc = "composite"
+        return stop_score, stop_desc
+
+    stop_metric_names = _get_early_stop_metric_names(opt, opt.stop_task)
+    stop_score = _safe_metric_sum(metrics.get(opt.stop_task, {}), stop_metric_names)
+    stop_desc = " ".join([opt.stop_task] + stop_metric_names)
+    return stop_score, stop_desc
+
+
 def _extract_semantic_opt_dict(opt):
     keys = [
+        "enable_compositional_supervision",
+        "positive_rewrite_sample_size",
+        "negative_rewrite_sample_size",
+        "positive_invariance_weight",
+        "negative_preference_weight",
+        "enable_debiased_retrieval_correction",
+        "debiased_retrieval_weight",
+        "compositional_warmup_epochs",
+        "compositional_ramp_epochs",
+        "negative_preference_delay_epochs",
+        "debiased_retrieval_delay_epochs",
+        "rewrite_type_quota_enabled",
+        "risky_negative_filter_enabled",
+        "risky_negative_overlap_threshold",
+        "risky_negative_start_epoch",
+        "risky_negative_downweight",
+        "collision_sanitization_enabled",
+        "allow_missing_rewrites",
+        "require_rewrite_cache",
         "semantic_enable",
         "semantic_backend",
         "semantic_strict_mode",
@@ -114,11 +188,46 @@ def _build_semantic_cache_from_opt(opt):
 def train_epoch(model, train_loader, optimizer, opt, epoch_i, training=True, semantic_runtime=None):
     logger.info("use train_epoch func for training: {}".format(training))
     model.train(mode=training)
+    model.set_train_epoch(epoch_i)
+    if semantic_runtime is not None:
+        semantic_runtime.set_current_epoch(epoch_i)
+        schedule = semantic_runtime.get_schedule_snapshot()
+        logger.info(
+            "compositional_supervision=%s schedule(pos=%.3f neg=%.3f deb=%.3f) sample_size(pos=%d neg=%d) quota=%s collision_sanitize=%s risky_filter=%s threshold=%.2f",
+            bool(getattr(opt, "enable_compositional_supervision", False) or getattr(opt, "semantic_enable", False)),
+            schedule.get("compositional_schedule_positive", 0.0),
+            schedule.get("compositional_schedule_negative", 0.0),
+            schedule.get("compositional_schedule_debiased", 0.0),
+            int(getattr(opt, "positive_rewrite_sample_size", getattr(opt, "semantic_num_hard_pos", 0))),
+            int(getattr(opt, "negative_rewrite_sample_size", getattr(opt, "semantic_num_hard_neg", 0))),
+            bool(getattr(opt, "rewrite_type_quota_enabled", False)),
+            bool(getattr(opt, "collision_sanitization_enabled", False)),
+            bool(getattr(opt, "risky_negative_filter_enabled", False)),
+            float(getattr(opt, "risky_negative_overlap_threshold", 0.0)),
+        )
     model_core_for_log = model.module if isinstance(model, torch.nn.DataParallel) else model
     logger.info(
-        "epoch %d retrieval_scorer=%s",
+        ("epoch %d retrieval_scorer=%s late_topk(train/eval/default)=%s/%s/%s "
+         "late_q_chunk=%s late_margin_gate=%.4f late_weight(train/eval/default)=%.4f/%.4f/%.4f "
+         "late_start_epoch=%d late_clip=%.4f late_soft_gate(T/min)=%.4f/%.4f "
+         "late_warmup=%d late_detach_backbone=%s late_vcl=%s"),
         epoch_i,
         getattr(model_core_for_log.config, "retrieval_scorer", "single_vector"),
+        getattr(model_core_for_log.config, "late_interaction_train_rerank_topk", 0),
+        getattr(model_core_for_log.config, "late_interaction_eval_rerank_topk", 0),
+        getattr(model_core_for_log.config, "late_interaction_rerank_topk", 0),
+        getattr(model_core_for_log.config, "late_interaction_query_chunk_size", 0),
+        float(getattr(model_core_for_log.config, "late_interaction_rerank_margin_threshold", -1.0)),
+        float(getattr(model_core_for_log.config, "late_interaction_train_score_weight", 0.0)),
+        float(getattr(model_core_for_log.config, "late_interaction_eval_score_weight", 0.0)),
+        float(getattr(model_core_for_log.config, "late_interaction_score_weight", 0.0)),
+        int(getattr(model_core_for_log.config, "late_interaction_train_start_epoch", 0)),
+        float(getattr(model_core_for_log.config, "late_interaction_residual_clip", -1.0)),
+        float(getattr(model_core_for_log.config, "late_interaction_rerank_soft_temperature", 0.0)),
+        float(getattr(model_core_for_log.config, "late_interaction_rerank_soft_min_gate", 0.0)),
+        int(getattr(model_core_for_log.config, "late_interaction_train_score_warmup_epochs", 0)),
+        bool(getattr(model_core_for_log.config, "late_interaction_detach_backbone_in_train", False)),
+        bool(getattr(model_core_for_log.config, "late_interaction_apply_to_vcl", False)),
     )
     if opt.hard_negative_start_epoch != -1 and epoch_i >= opt.hard_negative_start_epoch:
         model.set_hard_negative(True, opt.hard_pool_size)
@@ -136,6 +245,7 @@ def train_epoch(model, train_loader, optimizer, opt, epoch_i, training=True, sem
     if getattr(opt, "semantic_enable", False):
         loss_meters["loss_semantic_pref"] = AverageMeter()
         loss_meters["loss_semantic_cons"] = AverageMeter()
+        loss_meters["loss_semantic_debiased"] = AverageMeter()
         loss_meters["loss_semantic_total"] = AverageMeter()
 
     num_training_examples = len(train_loader)
@@ -242,7 +352,7 @@ def train(model, train_dataset, train_eval_dataset, val_dataset, opt, semantic_r
     num_train_optimization_steps = len(train_loader) * opt.n_epoch
     optimizer = BertAdam(optimizer_grouped_parameters, lr=opt.lr, weight_decay=opt.wd, warmup=opt.lr_warmup_proportion,
                          t_total=num_train_optimization_steps, schedule="warmup_linear")
-    prev_best_score = 0.
+    prev_best_score = float("-inf")
     es_cnt = 0
     start_epoch = -1 if opt.eval_untrained else 0
     eval_tasks_at_training = opt.eval_tasks_at_training  # VR is computed along with VCMR
@@ -250,7 +360,10 @@ def train(model, train_dataset, train_eval_dataset, val_dataset, opt, semantic_r
                                                                          "_".join(eval_tasks_at_training))
     for epoch_i in trange(start_epoch, opt.n_epoch, desc="Epoch"):
         if epoch_i > -1:
-            with torch.autograd.detect_anomaly():
+            if opt.debug:
+                with torch.autograd.detect_anomaly():
+                    train_epoch(model, train_loader, optimizer, opt, epoch_i, training=True, semantic_runtime=semantic_runtime)
+            else:
                 train_epoch(model, train_loader, optimizer, opt, epoch_i, training=True, semantic_runtime=semantic_runtime)
         global_step = (epoch_i + 1) * len(train_loader)
         if opt.eval_path is not None and train_eval_loader is not None:
@@ -280,10 +393,8 @@ def train(model, train_dataset, train_eval_dataset, val_dataset, opt, semantic_r
                 task_metrics = metrics[task_type]
                 opt.writer.add_scalars("Eval/{}".format(task_type), {k: v for k, v in task_metrics.items()},
                                        global_step)
-            # use the most strict metric available
-            stop_metric_names = ["r1"] if opt.stop_task == "VR" else ["0.5-r1", "0.7-r1"]
-            stop_score = sum([metrics[opt.stop_task][e] for e in stop_metric_names])
-            if stop_score > prev_best_score:
+            stop_score, stop_desc = _compute_stop_score(metrics, opt)
+            if stop_score > prev_best_score + opt.early_stop_min_delta:
                 es_cnt = 0
                 prev_best_score = stop_score
                 checkpoint = {"model": model.state_dict(), "model_cfg": model.config, "epoch": epoch_i}
@@ -294,11 +405,11 @@ def train(model, train_dataset, train_eval_dataset, val_dataset, opt, semantic_r
                 logger.info("The checkpoint file has been updated.")
             else:
                 es_cnt += 1
-                if opt.max_es_cnt != -1 and es_cnt > opt.max_es_cnt:  # early stop
+                if opt.max_es_cnt != -1 and es_cnt >= opt.max_es_cnt:  # early stop
                     with open(opt.train_log_filepath, "a") as f:
                         f.write("Early Stop at epoch {}".format(epoch_i))
                     logger.info("Early stop at {} with {} {}".format(
-                        epoch_i, " ".join([opt.stop_task] + stop_metric_names), prev_best_score))
+                        epoch_i, stop_desc, prev_best_score))
                     break
         else:
             checkpoint = {"model": model.state_dict(), "model_cfg": model.config, "epoch": epoch_i}
@@ -362,6 +473,10 @@ def start_training():
     if getattr(opt, "semantic_enable", False):
         semantic_cache_lookup = load_semantic_cache_lookup(opt, source_data_path=opt.train_path)
         semantic_runtime = SemanticLossRuntime(opt)
+        if semantic_cache_lookup is None:
+            logger.warning(
+                "compositional supervision enabled but no rewrite cache is loaded; training will automatically fall back to base objective for missing rewrites."
+            )
         semantic_summary = {
             "semantic_config": _extract_semantic_opt_dict(opt),
             "cache_manifest": semantic_cache_lookup.manifest if semantic_cache_lookup is not None else None,
@@ -446,8 +561,26 @@ def start_training():
         late_interaction_token_weight_floor=opt.late_interaction_token_weight_floor,
         late_interaction_score_reduction=opt.late_interaction_score_reduction,
         late_interaction_video_chunk_size=opt.late_interaction_video_chunk_size,
-        combined_retrieval_alpha=opt.combined_retrieval_alpha,
-        combined_retrieval_normalize=opt.combined_retrieval_normalize,
+        late_interaction_rerank_topk=opt.late_interaction_rerank_topk,
+        late_interaction_train_rerank_topk=opt.late_interaction_train_rerank_topk,
+        late_interaction_eval_rerank_topk=opt.late_interaction_eval_rerank_topk,
+        late_interaction_query_chunk_size=opt.late_interaction_query_chunk_size,
+        late_interaction_rerank_margin_threshold=opt.late_interaction_rerank_margin_threshold,
+        late_interaction_rerank_soft_temperature=opt.late_interaction_rerank_soft_temperature,
+        late_interaction_rerank_soft_min_gate=opt.late_interaction_rerank_soft_min_gate,
+        late_interaction_train_start_epoch=opt.late_interaction_train_start_epoch,
+        late_interaction_train_score_weight=opt.late_interaction_train_score_weight,
+        late_interaction_eval_score_weight=opt.late_interaction_eval_score_weight,
+        late_interaction_train_score_warmup_epochs=opt.late_interaction_train_score_warmup_epochs,
+        late_interaction_residual_clip=opt.late_interaction_residual_clip,
+        late_interaction_detach_backbone_in_train=opt.late_interaction_detach_backbone_in_train,
+        late_interaction_score_weight=opt.late_interaction_score_weight,
+        late_interaction_score_normalize=opt.late_interaction_score_normalize,
+        late_interaction_apply_to_vcl=opt.late_interaction_apply_to_vcl,
+        multi_vector_query_max_count=opt.multi_vector_query_max_count,
+        multi_vector_phrase_window=opt.multi_vector_phrase_window,
+        multi_vector_use_phrase_pooling=opt.multi_vector_use_phrase_pooling,
+        multi_vector_use_global_fallback=opt.multi_vector_use_global_fallback,
         use_generative_augmentation=opt.use_generative_augmentation,
         use_fusion_encoder=opt.use_fusion_encoder,
         fusion_num_layers=opt.fusion_num_layers,

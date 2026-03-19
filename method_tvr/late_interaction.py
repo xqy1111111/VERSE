@@ -4,11 +4,11 @@ import torch.nn.functional as F
 
 
 class LateInteractionRetriever(nn.Module):
-    """ColBERT-style late interaction scorer with mask-aware MaxSim aggregation.
+    """ColBERT-style late interaction scorer with controlled multi-vector queries.
 
     Shapes:
-        - query_vectors: (num_query, query_len, hidden_size)
-        - query_mask: (num_query, query_len)
+        - query_vectors: (num_query, query_len, hidden_size) from query encoder tokens
+        - query_mask: (num_query, query_len) token mask
         - context_vectors: (num_video, ctx_len, hidden_size)
         - context_mask: (num_video, ctx_len)
         - scores: (num_query, num_video)
@@ -23,6 +23,10 @@ class LateInteractionRetriever(nn.Module):
         token_weight_floor=0.0,
         score_reduction="mean",
         video_chunk_size=256,
+        multi_vector_query_max_count=6,
+        multi_vector_phrase_window=1,
+        multi_vector_use_phrase_pooling=True,
+        multi_vector_use_global_fallback=True,
     ):
         super().__init__()
         if interaction_dim <= 0:
@@ -35,11 +39,19 @@ class LateInteractionRetriever(nn.Module):
         self.token_weight_floor = float(token_weight_floor)
         self.score_reduction = str(score_reduction)
         self.video_chunk_size = int(video_chunk_size)
+        self.multi_vector_query_max_count = int(multi_vector_query_max_count)
+        self.multi_vector_phrase_window = int(multi_vector_phrase_window)
+        self.multi_vector_use_phrase_pooling = bool(multi_vector_use_phrase_pooling)
+        self.multi_vector_use_global_fallback = bool(multi_vector_use_global_fallback)
 
         if self.score_reduction not in {"sum", "mean"}:
             raise ValueError("score_reduction must be 'sum' or 'mean'")
         if self.video_chunk_size <= 0:
             raise ValueError("video_chunk_size must be > 0")
+        if self.multi_vector_query_max_count <= 0:
+            raise ValueError("multi_vector_query_max_count must be > 0")
+        if self.multi_vector_phrase_window < 0:
+            raise ValueError("multi_vector_phrase_window must be >= 0")
 
         if self.use_projection:
             self.query_projection = nn.Linear(self.hidden_size, self.interaction_dim, bias=False)
@@ -48,27 +60,81 @@ class LateInteractionRetriever(nn.Module):
             self.query_projection = nn.Identity()
             self.context_projection = nn.Identity()
 
+        self.content_vector_scorer = nn.Linear(self.interaction_dim, 1, bias=False)
         if self.use_token_weight:
-            self.query_token_weight = nn.Linear(self.interaction_dim, 1, bias=False)
+            self.query_vector_weight = nn.Linear(self.interaction_dim, 1, bias=False)
         else:
-            self.query_token_weight = None
+            self.query_vector_weight = None
 
-    def prepare_query_vectors(self, query_vectors, query_mask):
-        projected = self.query_projection(query_vectors)
-        projected = F.normalize(projected, dim=-1)
-        token_weights = self._build_query_token_weights(projected, query_mask)
-        return projected, token_weights
+    def _compute_content_logits(self, query_vectors, query_mask):
+        logits = self.content_vector_scorer(query_vectors).squeeze(-1)
+        return logits.masked_fill(query_mask <= 0, -1e4)
 
-    def prepare_context_vectors(self, context_vectors):
-        projected = self.context_projection(context_vectors)
-        return F.normalize(projected, dim=-1)
+    def _build_multi_vector_query(self, query_vectors, query_mask, content_logits):
+        batch_size, query_len, dim = query_vectors.shape
+        extra_slots = 1 if self.multi_vector_use_global_fallback else 0
+        max_slots = self.multi_vector_query_max_count + extra_slots
 
-    def _build_query_token_weights(self, query_vectors, query_mask):
+        multi_vectors = query_vectors.new_zeros((batch_size, max_slots, dim))
+        multi_mask = query_vectors.new_zeros((batch_size, max_slots))
+        multi_logits = query_vectors.new_full((batch_size, max_slots), -1e4)
+        multi_indices = torch.full(
+            (batch_size, max_slots),
+            -1,
+            dtype=torch.long,
+            device=query_vectors.device,
+        )
+
+        for query_idx in range(batch_size):
+            valid_indices = torch.nonzero(query_mask[query_idx] > 0, as_tuple=False).squeeze(-1)
+            if valid_indices.numel() == 0:
+                continue
+
+            top_count = min(self.multi_vector_query_max_count, int(valid_indices.numel()))
+            valid_logits = content_logits[query_idx, valid_indices]
+            top_rel = torch.topk(valid_logits, k=top_count, dim=0).indices
+            selected_indices = torch.sort(valid_indices[top_rel]).values
+
+            slot = 0
+            for token_index in selected_indices.tolist():
+                if self.multi_vector_use_phrase_pooling and self.multi_vector_phrase_window > 0:
+                    window_start = max(0, token_index - self.multi_vector_phrase_window)
+                    window_end = min(query_len, token_index + self.multi_vector_phrase_window + 1)
+                    window_mask = query_mask[query_idx, window_start:window_end] > 0
+                    if torch.any(window_mask):
+                        pooled_vector = query_vectors[query_idx, window_start:window_end][window_mask].mean(dim=0)
+                    else:
+                        pooled_vector = query_vectors[query_idx, token_index]
+                    selected_vector = F.normalize(pooled_vector, dim=0)
+                else:
+                    selected_vector = query_vectors[query_idx, token_index]
+
+                multi_vectors[query_idx, slot] = selected_vector
+                multi_mask[query_idx, slot] = 1.0
+                multi_logits[query_idx, slot] = content_logits[query_idx, token_index]
+                multi_indices[query_idx, slot] = token_index
+                slot += 1
+
+            if self.multi_vector_use_global_fallback:
+                valid_mask = query_mask[query_idx].float()
+                global_vector = (query_vectors[query_idx] * valid_mask.unsqueeze(-1)).sum(dim=0)
+                global_vector = global_vector / valid_mask.sum().clamp(min=1.0)
+                multi_vectors[query_idx, slot] = F.normalize(global_vector, dim=0)
+                multi_mask[query_idx, slot] = 1.0
+                if slot > 0:
+                    multi_logits[query_idx, slot] = multi_logits[query_idx, :slot].mean()
+                else:
+                    multi_logits[query_idx, slot] = 0.0
+                multi_indices[query_idx, slot] = -2  # sentinel for global fallback vector
+
+        return multi_vectors, multi_mask, multi_logits, multi_indices
+
+    def _build_query_vector_weights(self, query_vectors, query_mask, query_logits):
         valid_mask = query_mask.float()
-        if not self.use_token_weight:
-            return valid_mask
-
-        logits = self.query_token_weight(query_vectors).squeeze(-1)
+        if self.use_token_weight:
+            logits = self.query_vector_weight(query_vectors).squeeze(-1)
+        else:
+            logits = query_logits
         logits = logits.masked_fill(valid_mask == 0, -1e4)
         weights = torch.softmax(logits, dim=-1) * valid_mask
 
@@ -76,8 +142,33 @@ class LateInteractionRetriever(nn.Module):
             keep = (weights >= self.token_weight_floor).float() * valid_mask
             weights = weights * keep
 
+        has_weight = weights.sum(dim=1, keepdim=True) > 0
+        if not bool(torch.all(has_weight)):
+            weights = torch.where(has_weight, weights, valid_mask)
+
         denom = weights.sum(dim=1, keepdim=True).clamp(min=1e-6)
         return weights / denom
+
+    def prepare_query_vectors(self, query_vectors, query_mask, return_details=False):
+        projected = self.query_projection(query_vectors)
+        projected = F.normalize(projected, dim=-1)
+        content_logits = self._compute_content_logits(projected, query_mask)
+        multi_vectors, multi_mask, multi_logits, multi_indices = self._build_multi_vector_query(
+            projected,
+            query_mask,
+            content_logits,
+        )
+        multi_weights = self._build_query_vector_weights(multi_vectors, multi_mask, multi_logits)
+        if return_details:
+            return multi_vectors, multi_mask, multi_weights, {
+                "selected_indices": multi_indices,
+                "selected_logits": multi_logits,
+            }
+        return multi_vectors, multi_mask, multi_weights
+
+    def prepare_context_vectors(self, context_vectors):
+        projected = self.context_projection(context_vectors)
+        return F.normalize(projected, dim=-1)
 
     def forward(
         self,
@@ -86,27 +177,66 @@ class LateInteractionRetriever(nn.Module):
         context_vectors,
         context_mask,
         context_is_prepared=False,
+        return_diagnostics=False,
     ):
-        prepared_query, query_token_weights = self.prepare_query_vectors(query_vectors, query_mask)
+        if return_diagnostics:
+            prepared_query, prepared_query_mask, query_vector_weights, query_info = self.prepare_query_vectors(
+                query_vectors,
+                query_mask,
+                return_details=True,
+            )
+        else:
+            prepared_query, prepared_query_mask, query_vector_weights = self.prepare_query_vectors(
+                query_vectors,
+                query_mask,
+                return_details=False,
+            )
+            query_info = None
         if context_is_prepared:
             prepared_context = context_vectors
         else:
             prepared_context = self.prepare_context_vectors(context_vectors)
-        return self.score_prepared(
+        outputs = self.score_prepared(
             prepared_query,
-            query_token_weights,
+            prepared_query_mask,
+            query_vector_weights,
             context_mask,
             prepared_context,
+            return_contributions=return_diagnostics,
         )
+        if not return_diagnostics:
+            return outputs
 
-    def score_prepared(self, query_vectors, query_token_weights, context_mask, context_vectors):
+        scores, vector_contributions = outputs
+        diagnostics = {
+            "query_vector_mask": prepared_query_mask,
+            "query_vector_weights": query_vector_weights,
+            "vector_contributions": vector_contributions,
+        }
+        if query_info is not None:
+            diagnostics.update(query_info)
+        return scores, diagnostics
+
+    def score_prepared(
+        self,
+        query_vectors,
+        query_vector_mask,
+        query_vector_weights,
+        context_mask,
+        context_vectors,
+        return_contributions=False,
+    ):
         num_query = query_vectors.shape[0]
         num_video = context_vectors.shape[0]
-        query_len = query_vectors.shape[1]
+        num_vector = query_vectors.shape[1]
 
         scores = query_vectors.new_zeros((num_query, num_video))
+        vector_contributions = None
+        if return_contributions:
+            vector_contributions = query_vectors.new_zeros((num_query, num_vector, num_video))
         context_mask = context_mask.float()
         context_has_valid = context_mask.sum(dim=1) > 0
+        denom = (query_vector_weights * query_vector_mask).sum(dim=1, keepdim=True).clamp(min=1e-6)
 
         for video_start in range(0, num_video, self.video_chunk_size):
             video_end = min(video_start + self.video_chunk_size, num_video)
@@ -114,22 +244,55 @@ class LateInteractionRetriever(nn.Module):
             mask_chunk = context_mask[video_start:video_end]
             has_valid_chunk = context_has_valid[video_start:video_end]
 
-            chunk_scores = query_vectors.new_zeros((num_query, video_end - video_start))
-            for token_idx in range(query_len):
-                token_weight = query_token_weights[:, token_idx]
-                if torch.all(token_weight <= 0):
-                    continue
-
-                token_query = query_vectors[:, token_idx, :]
-                token_sim = torch.einsum("qd,vld->qvl", token_query, ctx_chunk)
-                token_sim = token_sim.masked_fill(mask_chunk.unsqueeze(0) == 0, -1e4)
-                token_max = token_sim.max(dim=-1).values
-                token_max = token_max.masked_fill(~has_valid_chunk.unsqueeze(0), 0.0)
-                chunk_scores += token_max * token_weight.unsqueeze(1)
+            # (q, v, m, l): query batch, video chunk, query multi-vectors, video clips
+            vector_sim = torch.einsum("qmd,vld->qvml", query_vectors, ctx_chunk)
+            vector_sim = vector_sim.masked_fill(mask_chunk.unsqueeze(0).unsqueeze(2) == 0, -1e4)
+            vector_max = vector_sim.max(dim=-1).values
+            vector_max = vector_max.masked_fill(~has_valid_chunk.unsqueeze(0).unsqueeze(-1), 0.0)
+            weighted_scores = vector_max * query_vector_weights.unsqueeze(1) * query_vector_mask.unsqueeze(1)
+            chunk_scores = weighted_scores.sum(dim=-1)
+            if self.score_reduction == "mean":
+                chunk_scores = chunk_scores / denom
+                if return_contributions:
+                    weighted_scores = weighted_scores / denom.unsqueeze(1)
 
             scores[:, video_start:video_end] = chunk_scores
+            if return_contributions:
+                vector_contributions[:, :, video_start:video_end] = weighted_scores
 
+        if return_contributions:
+            return scores, vector_contributions
+        return scores
+
+    def score_selected_prepared(
+        self,
+        query_vectors,
+        query_vector_mask,
+        query_vector_weights,
+        context_mask,
+        context_vectors,
+    ):
+        """Score query-specific candidate sets.
+
+        Args:
+            query_vectors: (num_query, num_vector, dim)
+            query_vector_mask: (num_query, num_vector)
+            query_vector_weights: (num_query, num_vector)
+            context_mask: (num_query, num_candidate, ctx_len)
+            context_vectors: (num_query, num_candidate, ctx_len, dim)
+        Returns:
+            scores: (num_query, num_candidate)
+        """
+        context_mask = context_mask.float()
+        context_has_valid = context_mask.sum(dim=-1) > 0
+        denom = (query_vector_weights * query_vector_mask).sum(dim=1, keepdim=True).clamp(min=1e-6)
+
+        vector_sim = torch.einsum("qmd,qkld->qkml", query_vectors, context_vectors)
+        vector_sim = vector_sim.masked_fill(context_mask.unsqueeze(2) == 0, -1e4)
+        vector_max = vector_sim.max(dim=-1).values
+        vector_max = vector_max.masked_fill(~context_has_valid.unsqueeze(-1), 0.0)
+        weighted_scores = vector_max * query_vector_weights.unsqueeze(1) * query_vector_mask.unsqueeze(1)
+        scores = weighted_scores.sum(dim=-1)
         if self.score_reduction == "mean":
-            denom = query_token_weights.sum(dim=1, keepdim=True).clamp(min=1e-6)
             scores = scores / denom
         return scores

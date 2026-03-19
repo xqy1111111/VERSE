@@ -61,3 +61,7 @@ method_tvr.bak_20260115_134311/
 
 # Project docs (keep local, do not track)
 docs/
+
+.codex/
+.agents/
+AGENTS.md
