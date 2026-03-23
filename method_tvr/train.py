@@ -233,13 +233,17 @@ def train_epoch(model, train_loader, optimizer, opt, epoch_i, training=True, sem
         model.set_hard_negative(True, opt.hard_pool_size)
     if opt.train_span_start_epoch != -1 and epoch_i >= opt.train_span_start_epoch:
         model.set_train_st_ed(opt.lw_st_ed)
+        model.set_train_span_joint(opt.lw_span_joint)
 
     # init meters
     dataloading_time = AverageMeter()
     prepare_inputs_time = AverageMeter()
     model_forward_time = AverageMeter()
     model_backward_time = AverageMeter()
-    loss_meters = OrderedDict(loss_st_ed=AverageMeter(), loss_fcl=AverageMeter(), loss_vcl=AverageMeter(),
+    loss_meters = OrderedDict(loss_st_ed=AverageMeter(),
+                              loss_span_joint=AverageMeter(),
+                              loss_fcl=AverageMeter(), loss_vcl=AverageMeter(),
+                              loss_debiased_video_frame=AverageMeter(),
                               loss_neg_ctx=AverageMeter(), loss_neg_q=AverageMeter(), loss_lm=AverageMeter(),
                               loss_overall=AverageMeter())
     if getattr(opt, "semantic_enable", False):
@@ -546,6 +550,8 @@ def start_training():
         hidden_size=opt.hidden_size,  # hidden dimension
         conv_kernel_size=opt.conv_kernel_size,
         conv_stride=opt.conv_stride,
+        span_head_type=opt.span_head_type,
+        span_biaffine_hidden_size=opt.span_biaffine_hidden_size,
         max_ctx_l=opt.max_ctx_l,
         max_desc_l=opt.max_desc_l,
         input_drop=opt.input_drop,
@@ -581,6 +587,13 @@ def start_training():
         multi_vector_phrase_window=opt.multi_vector_phrase_window,
         multi_vector_use_phrase_pooling=opt.multi_vector_use_phrase_pooling,
         multi_vector_use_global_fallback=opt.multi_vector_use_global_fallback,
+        event_token_compression_enabled=opt.event_token_compression_enabled,
+        event_token_compression_keep_ratio=opt.event_token_compression_keep_ratio,
+        event_token_compression_min_tokens=opt.event_token_compression_min_tokens,
+        event_token_compression_max_tokens=opt.event_token_compression_max_tokens,
+        event_token_compression_add_event_token=opt.event_token_compression_add_event_token,
+        event_token_compression_temperature=opt.event_token_compression_temperature,
+        event_token_compression_anchor_mode=opt.event_token_compression_anchor_mode,
         use_generative_augmentation=opt.use_generative_augmentation,
         use_fusion_encoder=opt.use_fusion_encoder,
         fusion_num_layers=opt.fusion_num_layers,
@@ -598,7 +611,18 @@ def start_training():
         lw_neg_ctx=opt.lw_neg_ctx,  # loss weight for pos. query and neg. context
         lw_fcl=opt.lw_fcl,  # loss weight for frame level contrastive learning
         lw_vcl=opt.lw_vcl,  # loss weight for video level contrastive learning
+        enable_debiased_video_frame_loss=opt.enable_debiased_video_frame_loss,
+        lw_debiased_video_frame_loss=opt.lw_debiased_video_frame_loss,
+        debiased_video_frame_start_epoch=opt.debiased_video_frame_start_epoch,
+        debiased_video_frame_temperature=opt.debiased_video_frame_temperature,
+        debiased_video_frame_gap_threshold=opt.debiased_video_frame_gap_threshold,
+        debiased_video_frame_gap_temperature=opt.debiased_video_frame_gap_temperature,
+        debiased_video_frame_min_negative_weight=opt.debiased_video_frame_min_negative_weight,
+        debiased_video_frame_background_similarity_threshold=opt.debiased_video_frame_background_similarity_threshold,
+        debiased_video_frame_background_temperature=opt.debiased_video_frame_background_temperature,
+        debiased_video_frame_background_downweight=opt.debiased_video_frame_background_downweight,
         lw_st_ed=0,  # will be assigned dynamically at training time
+        lw_span_joint=0,  # will be assigned dynamically at training time
         use_hard_negative=False,  # reset at each epoch
         hard_pool_size=opt.hard_pool_size)
     logger.info("model_config {}".format(model_config))

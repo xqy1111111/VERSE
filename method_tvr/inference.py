@@ -178,6 +178,10 @@ def index_if_not_none(input_tensor, indices):
 def compute_query2ctx_info_svmr_only(model, eval_dataset, opt, ctx_info, max_before_nms=1000):
     """Run SVMR-only inference where each query is evaluated on its ground-truth video."""
     model.eval()
+    model_core = model.module if isinstance(model, torch.nn.DataParallel) else model
+    use_joint_span = bool(getattr(model_core, "use_biaffine_span_head", False))
+    pair_chunk_size = int(getattr(opt, "span_infer_pair_chunk_size", 256))
+
     eval_dataset.set_data_mode("query")
     eval_dataset.load_gt_vid_name_for_query(True)
     query_eval_loader = DataLoader(
@@ -196,8 +200,14 @@ def compute_query2ctx_info_svmr_only(model, eval_dataset, opt, ctx_info, max_bef
     ctx_len = eval_dataset.max_ctx_len
 
     svmr_video2meta_idx = {entry["vid_name"]: idx for idx, entry in enumerate(video_metas)}
-    svmr_gt_st_probs = np.zeros((n_total_query, ctx_len), dtype=np.float32)
-    svmr_gt_ed_probs = np.zeros((n_total_query, ctx_len), dtype=np.float32)
+    if use_joint_span:
+        svmr_flat_span_scores_sorted_indices = np.empty((n_total_query, max_before_nms), dtype=np.int32)
+        svmr_flat_span_sorted_scores = np.zeros((n_total_query, max_before_nms), dtype=np.float32)
+        svmr_gt_st_probs, svmr_gt_ed_probs = None, None
+    else:
+        svmr_gt_st_probs = np.zeros((n_total_query, ctx_len), dtype=np.float32)
+        svmr_gt_ed_probs = np.zeros((n_total_query, ctx_len), dtype=np.float32)
+        svmr_flat_span_scores_sorted_indices, svmr_flat_span_sorted_scores = None, None
 
     query_metas = []
     for idx, batch in tqdm(enumerate(query_eval_loader), desc="Computing q embedding", total=len(query_eval_loader)):
@@ -212,37 +222,69 @@ def compute_query2ctx_info_svmr_only(model, eval_dataset, opt, ctx_info, max_bef
             requires_grad=False,
         )
 
-        _, st_probs, ed_probs = model.get_pred_from_raw_query(
+        selected_video_feat = index_if_not_none(ctx_info["video_feat"], query2video_meta_indices)
+        selected_video_mask = index_if_not_none(ctx_info["video_mask"], query2video_meta_indices)
+
+        pred_outputs = model.get_pred_from_raw_query(
             model_inputs["query_feat"],
             model_inputs["query_mask"],
-            index_if_not_none(ctx_info["video_feat"], query2video_meta_indices),
-            index_if_not_none(ctx_info["video_mask"], query2video_meta_indices),
+            selected_video_feat,
+            selected_video_mask,
             retrieval_context_feat=index_if_not_none(ctx_info.get("video_retrieval_feat"), query2video_meta_indices),
             cross=False,
+            return_query_feats=use_joint_span,
         )
 
-        st_probs = F.softmax(st_probs, dim=-1)
-        ed_probs = F.softmax(ed_probs, dim=-1)
-
-        svmr_gt_st_probs[idx * bsz:(idx + 1) * bsz, :st_probs.shape[1]] = st_probs.cpu().numpy()
-        svmr_gt_ed_probs[idx * bsz:(idx + 1) * bsz, :ed_probs.shape[1]] = ed_probs.cpu().numpy()
+        if use_joint_span:
+            video_query, _, st_probs, ed_probs = pred_outputs
+            span_probs = _compute_biaffine_span_probs_from_video_query(
+                model_core=model_core,
+                video_query=video_query,
+                video_feat=selected_video_feat,
+                video_mask=selected_video_mask,
+                pair_chunk_size=pair_chunk_size,
+            )
+            valid_prob_mask = generate_min_max_length_mask(span_probs.shape, min_l=opt.min_pred_l, max_l=opt.max_pred_l)
+            span_probs = span_probs * torch.from_numpy(valid_prob_mask).to(span_probs.device)
+            flat_span_probs = span_probs.reshape(span_probs.shape[0], -1)
+            flat_scores, flat_indices = torch.sort(flat_span_probs, dim=1, descending=True)
+            svmr_flat_span_sorted_scores[idx * bsz:(idx + 1) * bsz] = flat_scores[:, :max_before_nms].cpu().numpy()
+            svmr_flat_span_scores_sorted_indices[idx * bsz:(idx + 1) * bsz] = flat_indices[:, :max_before_nms].cpu().numpy()
+        else:
+            _, st_probs, ed_probs = pred_outputs
+            st_probs = F.softmax(st_probs, dim=-1)
+            ed_probs = F.softmax(ed_probs, dim=-1)
+            svmr_gt_st_probs[idx * bsz:(idx + 1) * bsz, :st_probs.shape[1]] = st_probs.cpu().numpy()
+            svmr_gt_ed_probs[idx * bsz:(idx + 1) * bsz, :ed_probs.shape[1]] = ed_probs.cpu().numpy()
 
         if opt.debug:
             break
 
     n_processed_query = len(query_metas)
-    svmr_gt_st_probs = svmr_gt_st_probs[:n_processed_query]
-    svmr_gt_ed_probs = svmr_gt_ed_probs[:n_processed_query]
-    svmr_res = get_svmr_res_from_st_ed_probs(
-        svmr_gt_st_probs,
-        svmr_gt_ed_probs,
-        query_metas,
-        video2idx,
-        clip_length=opt.clip_length,
-        min_pred_l=opt.min_pred_l,
-        max_pred_l=opt.max_pred_l,
-        max_before_nms=max_before_nms,
-    )
+    if use_joint_span:
+        svmr_flat_span_scores_sorted_indices = svmr_flat_span_scores_sorted_indices[:n_processed_query]
+        svmr_flat_span_sorted_scores = svmr_flat_span_sorted_scores[:n_processed_query]
+        svmr_res = get_svmr_res_from_flat_span_scores(
+            svmr_flat_span_scores_sorted_indices,
+            svmr_flat_span_sorted_scores,
+            query_metas,
+            video2idx,
+            clip_length=opt.clip_length,
+            ctx_len=ctx_len,
+        )
+    else:
+        svmr_gt_st_probs = svmr_gt_st_probs[:n_processed_query]
+        svmr_gt_ed_probs = svmr_gt_ed_probs[:n_processed_query]
+        svmr_res = get_svmr_res_from_st_ed_probs(
+            svmr_gt_st_probs,
+            svmr_gt_ed_probs,
+            query_metas,
+            video2idx,
+            clip_length=opt.clip_length,
+            min_pred_l=opt.min_pred_l,
+            max_pred_l=opt.max_pred_l,
+            max_before_nms=max_before_nms,
+        )
     return {"SVMR": svmr_res}
 
 
@@ -290,6 +332,60 @@ def get_svmr_res_from_st_ed_probs(svmr_gt_st_probs, svmr_gt_ed_probs, query_meta
     return svmr_res
 
 
+def _compute_biaffine_span_probs_from_video_query(model_core, video_query, video_feat, video_mask, pair_chunk_size):
+    """Compute pairwise biaffine span probabilities for aligned query-video pairs."""
+    n_pair = video_feat.shape[0]
+    if n_pair == 0:
+        ctx_len = int(video_mask.shape[1]) if video_mask.ndim == 2 else 0
+        return video_feat.new_zeros((0, ctx_len, ctx_len))
+
+    chunked_span_probs = []
+    for pair_start in range(0, n_pair, pair_chunk_size):
+        pair_end = min(pair_start + pair_chunk_size, n_pair)
+        _, _, span_logits_chunk = model_core.get_pairwise_span_scores_from_video_query(
+            video_query=video_query[pair_start:pair_end],
+            video_feat=video_feat[pair_start:pair_end],
+            video_mask=video_mask[pair_start:pair_end],
+            return_span_logits=True,
+        )
+        if span_logits_chunk is None:
+            raise RuntimeError("Biaffine span logits are required when span_head_type=biaffine_span_head")
+        span_probs_chunk = F.softmax(span_logits_chunk.reshape(span_logits_chunk.shape[0], -1), dim=-1)
+        span_probs_chunk = span_probs_chunk.reshape_as(span_logits_chunk)
+        chunked_span_probs.append(span_probs_chunk)
+
+    return torch.cat(chunked_span_probs, dim=0)
+
+
+def get_svmr_res_from_flat_span_scores(flat_span_sorted_indices, flat_span_sorted_scores,
+                                       query_metas, video2idx, clip_length, ctx_len):
+    """Convert flattened span rankings into ranked SVMR predictions."""
+    svmr_res = []
+    query_vid_names = [entry["vid_name"] for entry in query_metas]
+
+    for i, query_vid_name in tqdm(
+        enumerate(query_vid_names),
+        desc="[SVMR] Loop over queries to generate predictions",
+        total=len(query_vid_names),
+    ):
+        query_meta = query_metas[i]
+        video_idx = video2idx[query_vid_name]
+        pred_st_indices, pred_ed_indices = np.unravel_index(flat_span_sorted_indices[i], shape=(ctx_len, ctx_len))
+        pred_st_in_seconds = pred_st_indices.astype(np.float32) * clip_length
+        pred_ed_in_seconds = pred_ed_indices.astype(np.float32) * clip_length
+
+        ranked_predictions = [
+            [video_idx, float(pred_st_in_seconds[j]), float(pred_ed_in_seconds[j]), float(score)]
+            for j, score in enumerate(flat_span_sorted_scores[i])
+        ]
+        svmr_res.append({
+            "desc_id": query_meta["desc_id"],
+            "desc": query_meta["desc"],
+            "predictions": ranked_predictions,
+        })
+    return svmr_res
+
+
 def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=1000, max_n_videos=100,
                            tasks=("SVMR",)):
     """Run query-to-context inference for SVMR/VCMR/VR tasks."""
@@ -301,6 +397,10 @@ def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=10
     video_metas = ctx_info["video_metas"]
 
     model.eval()
+    model_core = model.module if isinstance(model, torch.nn.DataParallel) else model
+    use_joint_span = bool(getattr(model_core, "use_biaffine_span_head", False))
+    pair_chunk_size = int(getattr(opt, "span_infer_pair_chunk_size", 256))
+
     eval_dataset.set_data_mode("query")
     eval_dataset.load_gt_vid_name_for_query(is_svmr)
 
@@ -331,10 +431,18 @@ def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=10
 
     if is_svmr:
         svmr_video2meta_idx = {entry["vid_name"]: idx for idx, entry in enumerate(video_metas)}
-        svmr_gt_st_probs = np.zeros((n_total_query, opt.max_ctx_l), dtype=np.float32)
-        svmr_gt_ed_probs = np.zeros((n_total_query, opt.max_ctx_l), dtype=np.float32)
+        if use_joint_span:
+            svmr_flat_span_scores_sorted_indices = np.empty((n_total_query, max_before_nms), dtype=np.int32)
+            svmr_flat_span_sorted_scores = np.zeros((n_total_query, max_before_nms), dtype=np.float32)
+            svmr_gt_st_probs, svmr_gt_ed_probs = None, None
+        else:
+            svmr_gt_st_probs = np.zeros((n_total_query, opt.max_ctx_l), dtype=np.float32)
+            svmr_gt_ed_probs = np.zeros((n_total_query, opt.max_ctx_l), dtype=np.float32)
+            svmr_flat_span_scores_sorted_indices, svmr_flat_span_sorted_scores = None, None
     else:
-        svmr_video2meta_idx, svmr_gt_st_probs, svmr_gt_ed_probs = None, None, None
+        svmr_video2meta_idx = None
+        svmr_gt_st_probs, svmr_gt_ed_probs = None, None
+        svmr_flat_span_scores_sorted_indices, svmr_flat_span_sorted_scores = None, None
 
     collect_score_diagnostics = bool(getattr(opt, "export_score_diagnostics", False)) and (is_vr or is_vcmr)
     diagnostics_topk = int(getattr(opt, "score_diagnostics_topk", 10))
@@ -354,13 +462,23 @@ def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=10
             ctx_info["video_mask"],
             retrieval_context_feat=ctx_info.get("video_retrieval_feat"),
             cross=True,
+            return_query_feats=use_joint_span,
             return_retrieval_details=collect_score_diagnostics,
         )
-        if collect_score_diagnostics:
-            raw_query_context_scores, st_probs, ed_probs, retrieval_details = pred_outputs
+
+        cursor = 0
+        if use_joint_span:
+            video_query = pred_outputs[cursor]
+            cursor += 1
         else:
-            raw_query_context_scores, st_probs, ed_probs = pred_outputs
-            retrieval_details = None
+            video_query = None
+        raw_query_context_scores = pred_outputs[cursor]
+        cursor += 1
+        st_probs = pred_outputs[cursor]
+        cursor += 1
+        ed_probs = pred_outputs[cursor]
+        cursor += 1
+        retrieval_details = pred_outputs[cursor] if collect_score_diagnostics else None
 
         query_context_scores = torch.exp(opt.q2c_alpha * raw_query_context_scores)
         st_probs = F.softmax(st_probs, dim=-1)
@@ -373,10 +491,27 @@ def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=10
                 dtype=torch.long,
                 device=st_probs.device,
             )
-            svmr_gt_st_probs[idx * bsz:(idx + 1) * bsz, :st_probs.shape[2]] = \
-                st_probs[row_indices, query2video_meta_indices].cpu().numpy()
-            svmr_gt_ed_probs[idx * bsz:(idx + 1) * bsz, :ed_probs.shape[2]] = \
-                ed_probs[row_indices, query2video_meta_indices].cpu().numpy()
+            if use_joint_span:
+                selected_video_feat = ctx_info["video_feat"][query2video_meta_indices]
+                selected_video_mask = ctx_info["video_mask"][query2video_meta_indices]
+                svmr_span_probs = _compute_biaffine_span_probs_from_video_query(
+                    model_core=model_core,
+                    video_query=video_query,
+                    video_feat=selected_video_feat,
+                    video_mask=selected_video_mask,
+                    pair_chunk_size=pair_chunk_size,
+                )
+                valid_prob_mask = generate_min_max_length_mask(
+                    svmr_span_probs.shape, min_l=opt.min_pred_l, max_l=opt.max_pred_l
+                )
+                svmr_span_probs = svmr_span_probs * torch.from_numpy(valid_prob_mask).to(svmr_span_probs.device)
+                flat_span_probs = svmr_span_probs.reshape(svmr_span_probs.shape[0], -1)
+                flat_scores, flat_indices = torch.sort(flat_span_probs, dim=1, descending=True)
+                svmr_flat_span_sorted_scores[idx * bsz:(idx + 1) * bsz] = flat_scores[:, :max_before_nms].cpu().numpy()
+                svmr_flat_span_scores_sorted_indices[idx * bsz:(idx + 1) * bsz] = flat_indices[:, :max_before_nms].cpu().numpy()
+            else:
+                svmr_gt_st_probs[idx * bsz:(idx + 1) * bsz, :st_probs.shape[2]] = st_probs[row_indices, query2video_meta_indices].cpu().numpy()
+                svmr_gt_ed_probs[idx * bsz:(idx + 1) * bsz, :ed_probs.shape[2]] = ed_probs[row_indices, query2video_meta_indices].cpu().numpy()
 
         if not (is_vr or is_vcmr):
             continue
@@ -422,9 +557,7 @@ def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=10
                         })
             continue
 
-        row_indices = torch.arange(0, len(st_probs), device=opt.device).unsqueeze(1)
-        st_probs_topk = st_probs[row_indices, sorted_indices]
-        ed_probs_topk = ed_probs[row_indices, sorted_indices]
+        row_indices = torch.arange(0, len(st_probs), device=st_probs.device).unsqueeze(1)
         raw_scores_topk = raw_query_context_scores[row_indices, sorted_indices]
         vcmr_video_scores_topk = torch.exp(opt.q2c_alpha_vcmr * raw_scores_topk)
         if opt.vcmr_video_score_weight != 1.0:
@@ -433,11 +566,38 @@ def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=10
                 opt.vcmr_video_score_weight,
             )
 
-        st_ed_scores = torch.einsum("qvm,qv,qvn->qvmn", st_probs_topk, vcmr_video_scores_topk, ed_probs_topk)
-        valid_prob_mask = generate_min_max_length_mask(st_ed_scores.shape, min_l=opt.min_pred_l, max_l=opt.max_pred_l)
-        st_ed_scores *= torch.from_numpy(valid_prob_mask).to(st_ed_scores.device)
-        best_vcmr_scores_topk = st_ed_scores.amax(dim=(2, 3))
-        best_span_scores_topk = best_vcmr_scores_topk / torch.clamp(vcmr_video_scores_topk, min=1e-8)
+        if use_joint_span:
+            topk_span_prob_rows = []
+            for local_q in range(sorted_indices.shape[0]):
+                local_indices = sorted_indices[local_q]
+                local_video_feat = ctx_info["video_feat"][local_indices]
+                local_video_mask = ctx_info["video_mask"][local_indices]
+                repeated_video_query = video_query[local_q:local_q + 1].expand(local_video_feat.shape[0], -1)
+                local_span_probs = _compute_biaffine_span_probs_from_video_query(
+                    model_core=model_core,
+                    video_query=repeated_video_query,
+                    video_feat=local_video_feat,
+                    video_mask=local_video_mask,
+                    pair_chunk_size=pair_chunk_size,
+                )
+                topk_span_prob_rows.append(local_span_probs.unsqueeze(0))
+            span_probs_topk = torch.cat(topk_span_prob_rows, dim=0)
+
+            valid_prob_mask = generate_min_max_length_mask(span_probs_topk.shape, min_l=opt.min_pred_l, max_l=opt.max_pred_l)
+            valid_prob_mask = torch.from_numpy(valid_prob_mask).to(span_probs_topk.device)
+            span_probs_topk = span_probs_topk * valid_prob_mask
+
+            st_ed_scores = span_probs_topk * vcmr_video_scores_topk.unsqueeze(-1).unsqueeze(-1)
+            best_span_scores_topk = span_probs_topk.amax(dim=(2, 3))
+            best_vcmr_scores_topk = st_ed_scores.amax(dim=(2, 3))
+        else:
+            st_probs_topk = st_probs[row_indices, sorted_indices]
+            ed_probs_topk = ed_probs[row_indices, sorted_indices]
+            st_ed_scores = torch.einsum("qvm,qv,qvn->qvmn", st_probs_topk, vcmr_video_scores_topk, ed_probs_topk)
+            valid_prob_mask = generate_min_max_length_mask(st_ed_scores.shape, min_l=opt.min_pred_l, max_l=opt.max_pred_l)
+            st_ed_scores *= torch.from_numpy(valid_prob_mask).to(st_ed_scores.device)
+            best_vcmr_scores_topk = st_ed_scores.amax(dim=(2, 3))
+            best_span_scores_topk = best_vcmr_scores_topk / torch.clamp(vcmr_video_scores_topk, min=1e-8)
 
         n_q = st_ed_scores.shape[0]
         flat_st_ed_scores = st_ed_scores.reshape(n_q, -1)
@@ -492,8 +652,12 @@ def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=10
 
     n_processed_query = len(query_metas)
     if is_svmr:
-        svmr_gt_st_probs = svmr_gt_st_probs[:n_processed_query]
-        svmr_gt_ed_probs = svmr_gt_ed_probs[:n_processed_query]
+        if use_joint_span:
+            svmr_flat_span_scores_sorted_indices = svmr_flat_span_scores_sorted_indices[:n_processed_query]
+            svmr_flat_span_sorted_scores = svmr_flat_span_sorted_scores[:n_processed_query]
+        else:
+            svmr_gt_st_probs = svmr_gt_st_probs[:n_processed_query]
+            svmr_gt_ed_probs = svmr_gt_ed_probs[:n_processed_query]
     if is_vr or is_vcmr:
         sorted_q2c_indices = sorted_q2c_indices[:n_processed_query]
         sorted_q2c_scores = sorted_q2c_scores[:n_processed_query]
@@ -504,16 +668,26 @@ def compute_query2ctx_info(model, eval_dataset, opt, ctx_info, max_before_nms=10
 
     svmr_res = []
     if is_svmr:
-        svmr_res = get_svmr_res_from_st_ed_probs(
-            svmr_gt_st_probs,
-            svmr_gt_ed_probs,
-            query_metas,
-            video2idx,
-            clip_length=opt.clip_length,
-            min_pred_l=opt.min_pred_l,
-            max_pred_l=opt.max_pred_l,
-            max_before_nms=max_before_nms,
-        )
+        if use_joint_span:
+            svmr_res = get_svmr_res_from_flat_span_scores(
+                svmr_flat_span_scores_sorted_indices,
+                svmr_flat_span_sorted_scores,
+                query_metas,
+                video2idx,
+                clip_length=opt.clip_length,
+                ctx_len=opt.max_ctx_l,
+            )
+        else:
+            svmr_res = get_svmr_res_from_st_ed_probs(
+                svmr_gt_st_probs,
+                svmr_gt_ed_probs,
+                query_metas,
+                video2idx,
+                clip_length=opt.clip_length,
+                min_pred_l=opt.min_pred_l,
+                max_pred_l=opt.max_pred_l,
+                max_before_nms=max_before_nms,
+            )
 
     vr_res = []
     if is_vr:

@@ -7,10 +7,12 @@ from easydict import EasyDict as edict
 
 from method_tvr.bimamba import BiMambaEncoderLayer
 from method_tvr.contrastive import batch_video_query_loss
+from method_tvr.debiased_video_frame_loss import compute_debiased_video_frame_loss
 from method_tvr.late_interaction import LateInteractionRetriever
 from method_tvr.model_components import (BertAttention, CrossAttentionLayer, LinearLayer,
                                          MILNCELoss, TrainablePositionalEncoding)
 from method_tvr.query_decoder import QueryDecoder
+from method_tvr.span_heads import BiaffineSpanHead
 
 
 class FusionEncoderLayer(nn.Module):
@@ -87,6 +89,34 @@ class ReLoCLNet(nn.Module):
         )
         self.merged_st_predictor = nn.Conv1d(**conv_cfg)
         self.merged_ed_predictor = nn.Conv1d(**conv_cfg)
+
+        self.span_head_type = str(getattr(config, "span_head_type", "independent_1d"))
+        self.use_biaffine_span_head = self.span_head_type == "biaffine_span_head"
+        self.span_biaffine_hidden_size = int(getattr(config, "span_biaffine_hidden_size", 128))
+        self.biaffine_span_head = (
+            BiaffineSpanHead(self.span_biaffine_hidden_size, dropout=config.drop)
+            if self.use_biaffine_span_head else None
+        )
+        self.lw_span_joint = float(getattr(config, "lw_span_joint", 0.0))
+
+        self.enable_debiased_video_frame_loss = bool(getattr(config, "enable_debiased_video_frame_loss", False))
+        self.lw_debiased_video_frame_loss = float(getattr(config, "lw_debiased_video_frame_loss", 0.0))
+        self.debiased_video_frame_start_epoch = int(getattr(config, "debiased_video_frame_start_epoch", 0))
+        self.debiased_video_frame_temperature = float(getattr(config, "debiased_video_frame_temperature", 0.07))
+        self.debiased_video_frame_gap_threshold = float(getattr(config, "debiased_video_frame_gap_threshold", 0.05))
+        self.debiased_video_frame_gap_temperature = float(getattr(config, "debiased_video_frame_gap_temperature", 0.05))
+        self.debiased_video_frame_min_negative_weight = float(
+            getattr(config, "debiased_video_frame_min_negative_weight", 0.05)
+        )
+        self.debiased_video_frame_background_similarity_threshold = float(
+            getattr(config, "debiased_video_frame_background_similarity_threshold", 0.6)
+        )
+        self.debiased_video_frame_background_temperature = float(
+            getattr(config, "debiased_video_frame_background_temperature", 0.1)
+        )
+        self.debiased_video_frame_background_downweight = float(
+            getattr(config, "debiased_video_frame_background_downweight", 0.5)
+        )
 
         self.temporal_criterion = nn.CrossEntropyLoss(reduction="mean")
         self.nce_criterion = MILNCELoss(reduction="mean")
@@ -181,6 +211,28 @@ class ReLoCLNet(nn.Module):
             raise ValueError("late_interaction_rank_gamma must be > 0")
         if self.late_interaction_train_score_warmup_epochs < 0:
             raise ValueError("late_interaction_train_score_warmup_epochs must be >= 0")
+        if self.span_head_type not in {"independent_1d", "biaffine_span_head"}:
+            raise ValueError("span_head_type must be one of {'independent_1d', 'biaffine_span_head'}")
+        if self.span_biaffine_hidden_size <= 0:
+            raise ValueError("span_biaffine_hidden_size must be > 0")
+        if self.lw_span_joint < 0:
+            raise ValueError("lw_span_joint must be >= 0")
+        if self.lw_debiased_video_frame_loss < 0:
+            raise ValueError("lw_debiased_video_frame_loss must be >= 0")
+        if self.debiased_video_frame_start_epoch < 0:
+            raise ValueError("debiased_video_frame_start_epoch must be >= 0")
+        if self.debiased_video_frame_temperature <= 0:
+            raise ValueError("debiased_video_frame_temperature must be > 0")
+        if self.debiased_video_frame_gap_temperature <= 0:
+            raise ValueError("debiased_video_frame_gap_temperature must be > 0")
+        if not (0.0 <= self.debiased_video_frame_min_negative_weight <= 1.0):
+            raise ValueError("debiased_video_frame_min_negative_weight must be in [0, 1]")
+        if self.debiased_video_frame_background_temperature <= 0:
+            raise ValueError("debiased_video_frame_background_temperature must be > 0")
+        if not (0.0 <= self.debiased_video_frame_background_downweight <= 1.0):
+            raise ValueError("debiased_video_frame_background_downweight must be in [0, 1]")
+        if not self.enable_debiased_video_frame_loss:
+            self.lw_debiased_video_frame_loss = 0.0
 
         if self.use_late_residual:
             self.late_interaction_retriever = LateInteractionRetriever(
@@ -195,6 +247,13 @@ class ReLoCLNet(nn.Module):
                 multi_vector_phrase_window=getattr(config, "multi_vector_phrase_window", 1),
                 multi_vector_use_phrase_pooling=getattr(config, "multi_vector_use_phrase_pooling", True),
                 multi_vector_use_global_fallback=getattr(config, "multi_vector_use_global_fallback", True),
+                event_token_compression_enabled=getattr(config, "event_token_compression_enabled", False),
+                event_token_compression_keep_ratio=getattr(config, "event_token_compression_keep_ratio", 1.0),
+                event_token_compression_min_tokens=getattr(config, "event_token_compression_min_tokens", 0),
+                event_token_compression_max_tokens=getattr(config, "event_token_compression_max_tokens", 0),
+                event_token_compression_add_event_token=getattr(config, "event_token_compression_add_event_token", False),
+                event_token_compression_temperature=getattr(config, "event_token_compression_temperature", 1.0),
+                event_token_compression_anchor_mode=getattr(config, "event_token_compression_anchor_mode", "boundary"),
             )
         else:
             self.late_interaction_retriever = None
@@ -271,6 +330,9 @@ class ReLoCLNet(nn.Module):
     def set_train_st_ed(self, lw_st_ed):
         self.config.lw_st_ed = lw_st_ed
 
+    def set_train_span_joint(self, lw_span_joint):
+        self.config.lw_span_joint = lw_span_joint
+
     def set_train_epoch(self, epoch_i):
         self.current_train_epoch = int(epoch_i)
 
@@ -293,13 +355,22 @@ class ReLoCLNet(nn.Module):
             x_video_feat,
             video_mask,
             cross=False,
+            return_span_logits=self.use_biaffine_span_head,
             return_query_feats=True,
             return_encoded_query=self.use_fusion_encoder or self.use_late_component,
         )
         if self.use_fusion_encoder or self.use_late_component:
-            video_query, query_context_scores, st_prob, ed_prob, encoded_query = outputs
+            if self.use_biaffine_span_head:
+                video_query, query_context_scores, st_prob, ed_prob, span_joint_logits, encoded_query = outputs
+            else:
+                video_query, query_context_scores, st_prob, ed_prob, encoded_query = outputs
+                span_joint_logits = None
         else:
-            video_query, query_context_scores, st_prob, ed_prob = outputs
+            if self.use_biaffine_span_head:
+                video_query, query_context_scores, st_prob, ed_prob, span_joint_logits = outputs
+            else:
+                video_query, query_context_scores, st_prob, ed_prob = outputs
+                span_joint_logits = None
             encoded_query = None
 
         loss_fcl = 0
@@ -329,6 +400,36 @@ class ReLoCLNet(nn.Module):
             loss_ed = self.temporal_criterion(ed_prob, st_ed_indices[:, 1])
             loss_st_ed = self.config.lw_st_ed * (loss_st + loss_ed)
 
+        loss_span_joint = 0
+        if span_joint_logits is not None and self.config.lw_span_joint > 0:
+            ctx_len = span_joint_logits.shape[-1]
+            target_st = st_ed_indices[:, 0].clamp(min=0, max=ctx_len - 1)
+            target_ed = st_ed_indices[:, 1].clamp(min=0, max=ctx_len - 1)
+            target_ed = torch.maximum(target_ed, target_st)
+            target_joint = target_st * ctx_len + target_ed
+            loss_joint = self.temporal_criterion(span_joint_logits.reshape(span_joint_logits.shape[0], -1), target_joint)
+            loss_span_joint = self.config.lw_span_joint * loss_joint
+
+        loss_debiased_video_frame = 0
+        if (
+            self.enable_debiased_video_frame_loss
+            and self.lw_debiased_video_frame_loss > 0
+            and self.current_train_epoch >= self.debiased_video_frame_start_epoch
+        ):
+            debiased_video_frame_raw = compute_debiased_video_frame_loss(
+                query_context_scores=query_context_scores,
+                video_feat=x_video_feat,
+                video_mask=video_mask,
+                temperature=self.debiased_video_frame_temperature,
+                gap_threshold=self.debiased_video_frame_gap_threshold,
+                gap_temperature=self.debiased_video_frame_gap_temperature,
+                min_negative_weight=self.debiased_video_frame_min_negative_weight,
+                background_similarity_threshold=self.debiased_video_frame_background_similarity_threshold,
+                background_temperature=self.debiased_video_frame_background_temperature,
+                background_downweight=self.debiased_video_frame_background_downweight,
+            )
+            loss_debiased_video_frame = self.lw_debiased_video_frame_loss * debiased_video_frame_raw
+
         loss_neg_ctx, loss_neg_q = 0, 0
         if self.config.lw_neg_ctx != 0 or self.config.lw_neg_q != 0:
             loss_neg_ctx, loss_neg_q = self.get_video_level_loss(query_context_scores)
@@ -348,11 +449,22 @@ class ReLoCLNet(nn.Module):
                 )
             loss_lm = self.compute_lm_loss(query_input_ids, query_attn_mask, fused_video_feat, video_mask)
 
-        loss = loss_fcl + loss_vcl + loss_st_ed + loss_neg_ctx + loss_neg_q + self.lm_weight * loss_lm
+        loss = (
+            loss_fcl
+            + loss_vcl
+            + loss_st_ed
+            + loss_span_joint
+            + loss_debiased_video_frame
+            + loss_neg_ctx
+            + loss_neg_q
+            + self.lm_weight * loss_lm
+        )
         loss_dict = {
             "loss_st_ed": float(loss_st_ed),
+            "loss_span_joint": float(loss_span_joint),
             "loss_fcl": float(loss_fcl),
             "loss_vcl": float(loss_vcl),
+            "loss_debiased_video_frame": float(loss_debiased_video_frame),
             "loss_neg_ctx": float(loss_neg_ctx),
             "loss_neg_q": float(loss_neg_q),
             "loss_lm": float(loss_lm),
@@ -738,7 +850,32 @@ class ReLoCLNet(nn.Module):
             return torch.einsum("md,nld->mnl", video_query, video_feat)
         return torch.einsum("bd,bld->bl", video_query, video_feat)
 
+    def get_pairwise_span_scores_from_video_query(self, video_query, video_feat, video_mask, return_span_logits=False):
+        similarity = self.get_merged_score(video_query, video_feat, cross=False)
+        st_prob, ed_prob, span_logits = self.get_merged_st_ed_prob(similarity, video_mask, cross=False)
+        if return_span_logits:
+            return st_prob, ed_prob, span_logits
+        return st_prob, ed_prob
+
+    def get_pairwise_span_scores(self, query_feat, query_mask, video_feat, video_mask, return_span_logits=False):
+        video_query = self.encode_query(query_feat, query_mask)
+        return self.get_pairwise_span_scores_from_video_query(
+            video_query=video_query,
+            video_feat=video_feat,
+            video_mask=video_mask,
+            return_span_logits=return_span_logits,
+        )
+
     def get_merged_st_ed_prob(self, similarity, context_mask, cross=False):
+        if self.use_biaffine_span_head and not cross:
+            span_logits = self.biaffine_span_head(similarity, context_mask, cross=False)
+            st_prob = torch.max(span_logits, dim=-1).values
+            ed_prob = torch.max(span_logits, dim=-2).values
+            st_prob = mask_logits(st_prob, context_mask)
+            ed_prob = mask_logits(ed_prob, context_mask)
+            return st_prob, ed_prob, span_logits
+
+        span_logits = None
         if cross:
             n_q, n_c, length = similarity.shape
             similarity = similarity.view(n_q * n_c, 1, length)
@@ -749,7 +886,7 @@ class ReLoCLNet(nn.Module):
             ed_prob = self.merged_ed_predictor(similarity.unsqueeze(1)).squeeze(1)
         st_prob = mask_logits(st_prob, context_mask)
         ed_prob = mask_logits(ed_prob, context_mask)
-        return st_prob, ed_prob
+        return st_prob, ed_prob, span_logits
 
     def get_pred_from_raw_query(
         self,
@@ -761,6 +898,7 @@ class ReLoCLNet(nn.Module):
         cross=False,
         return_query_feats=False,
         return_encoded_query=False,
+        return_span_logits=False,
         return_similarity=False,
         return_retrieval_details=False,
     ):
@@ -794,12 +932,14 @@ class ReLoCLNet(nn.Module):
             q2ctx_scores = retrieval_outputs
             retrieval_details = None
         similarity = self.get_merged_score(video_query, video_feat, cross=cross)
-        st_prob, ed_prob = self.get_merged_st_ed_prob(similarity, video_mask, cross=cross)
+        st_prob, ed_prob, span_logits = self.get_merged_st_ed_prob(similarity, video_mask, cross=cross)
 
         outputs = []
         if return_query_feats:
             outputs.append(video_query)
         outputs.extend([q2ctx_scores, st_prob, ed_prob])
+        if return_span_logits:
+            outputs.append(span_logits)
         if return_encoded_query:
             outputs.append(encoded_query)
         if return_similarity:

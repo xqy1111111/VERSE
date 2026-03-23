@@ -27,7 +27,7 @@ class BaseOptions(object):
         self.parser.add_argument("--debug", action="store_true",
                                  help="debug (fast) mode, break all loops, do not load all data into memory.")
         self.parser.add_argument("--data_ratio", type=float, default=1.0,
-                                 help="how many training and eval data to use. 1.0: use all, 0.1: use 10%."
+                                 help="how many training and eval data to use. 1.0: use all, 0.1: use 10%%."
                                       "Use small portion for debug purposes. Note this is different from --debug, "
                                       "which works by breaking the loops, typically they are not used together.")
         self.parser.add_argument("--results_root", type=str, default="results")
@@ -93,6 +93,8 @@ class BaseOptions(object):
                                  choices=["VCMR", "SVMR", "VR"], help="evaluate and report numbers for tasks.")
         self.parser.add_argument("--bsz", type=int, default=128, help="mini-batch size")
         self.parser.add_argument("--eval_query_bsz", type=int, default=50, help="minibatch size at inference for query")
+        self.parser.add_argument("--span_infer_pair_chunk_size", type=int, default=256,
+                                 help="Pairwise chunk size for biaffine span inference on top-k videos.")
         self.parser.add_argument("--eval_context_bsz", type=int, default=200,
                                  help="mini-batch size at inference for context videos")
         self.parser.add_argument("--eval_untrained", action="store_true", help="Evaluate on un-trained model")
@@ -103,8 +105,30 @@ class BaseOptions(object):
         self.parser.add_argument("--lw_neg_ctx", type=float, default=1,
                                  help="weight for ranking loss with positive query and negative context")
         self.parser.add_argument("--lw_st_ed", type=float, default=0.01, help="weight for st ed prediction loss")
+        self.parser.add_argument("--lw_span_joint", type=float, default=0.01,
+                                 help="weight for biaffine joint span prediction loss")
         self.parser.add_argument("--lw_fcl", type=float, default=0.03, help="weight for frame CL loss")
         self.parser.add_argument("--lw_vcl", type=float, default=0.03, help="weight for video CL loss")
+        self.parser.add_argument("--enable_debiased_video_frame_loss", action="store_true",
+                                 help="Enable debiased/background-aware in-batch video-frame contrastive loss.")
+        self.parser.add_argument("--lw_debiased_video_frame_loss", type=float, default=0.0,
+                                 help="Weight for debiased/background-aware in-batch video-frame loss.")
+        self.parser.add_argument("--debiased_video_frame_start_epoch", type=int, default=0,
+                                 help="Start epoch for debiased video-frame loss.")
+        self.parser.add_argument("--debiased_video_frame_temperature", type=float, default=0.07,
+                                 help="Temperature for debiased in-batch contrastive normalization.")
+        self.parser.add_argument("--debiased_video_frame_gap_threshold", type=float, default=0.05,
+                                 help="Gap threshold to downweight near-positive negatives.")
+        self.parser.add_argument("--debiased_video_frame_gap_temperature", type=float, default=0.05,
+                                 help="Temperature for near-positive gap weighting.")
+        self.parser.add_argument("--debiased_video_frame_min_negative_weight", type=float, default=0.05,
+                                 help="Minimum retained weight for any in-batch negative.")
+        self.parser.add_argument("--debiased_video_frame_background_similarity_threshold", type=float, default=0.6,
+                                 help="Background similarity threshold for extra negative downweighting.")
+        self.parser.add_argument("--debiased_video_frame_background_temperature", type=float, default=0.1,
+                                 help="Temperature for background-similarity downweighting gate.")
+        self.parser.add_argument("--debiased_video_frame_background_downweight", type=float, default=0.5,
+                                 help="Downweight strength for background-similar negatives.")
         self.parser.add_argument("--train_span_start_epoch", type=int, default=0,
                                  help="which epoch to start training span prediction, -1 to disable")
         self.parser.add_argument("--ranking_loss_type", type=str, default="hinge", choices=["hinge", "lse"],
@@ -143,6 +167,11 @@ class BaseOptions(object):
         self.parser.add_argument("--conv_kernel_size", type=int, default=5)
         self.parser.add_argument("--conv_stride", type=int, default=1)
         self.parser.add_argument("--initializer_range", type=float, default=0.02, help="initializer range for layers")
+        self.parser.add_argument("--span_head_type", type=str, default="independent_1d",
+                                 choices=["independent_1d", "biaffine_span_head"],
+                                 help="Temporal span head type: independent 1D start/end or biaffine joint span.")
+        self.parser.add_argument("--span_biaffine_hidden_size", type=int, default=128,
+                                 help="Hidden size used by biaffine span head when enabled.")
 
         self.parser.add_argument("--backbone_type", type=str, default="Transformer",
                                  choices=["Transformer", "BiMamba"])
@@ -227,6 +256,21 @@ class BaseOptions(object):
                                  help="Disable local phrase pooling and use selected content tokens directly.")
         self.parser.add_argument("--multi_vector_no_global_fallback", action="store_true",
                                  help="Disable adding one global fallback query vector.")
+        self.parser.add_argument("--event_token_compression_enabled", action="store_true",
+                                 help="Enable event/anchor-aware token compression before late interaction token selection.")
+        self.parser.add_argument("--event_token_compression_keep_ratio", type=float, default=1.0,
+                                 help="Fraction of valid query tokens to keep before multi-vector selection.")
+        self.parser.add_argument("--event_token_compression_min_tokens", type=int, default=0,
+                                 help="Minimum kept query tokens when event token compression is enabled.")
+        self.parser.add_argument("--event_token_compression_max_tokens", type=int, default=0,
+                                 help="Maximum kept query tokens when event token compression is enabled; <=0 means no cap.")
+        self.parser.add_argument("--event_token_compression_add_event_token", action="store_true",
+                                 help="Append one synthetic event token after compression.")
+        self.parser.add_argument("--event_token_compression_temperature", type=float, default=1.0,
+                                 help="Softmax temperature for synthetic event token aggregation.")
+        self.parser.add_argument("--event_token_compression_anchor_mode", type=str, default="boundary",
+                                 choices=["none", "boundary"],
+                                 help="Anchor retention strategy for token compression.")
 
         self.parser.add_argument("--use_generative_augmentation", action="store_true",
                                  help="Enable decoder LM loss during training")
@@ -588,6 +632,43 @@ class BaseOptions(object):
             raise ValueError("--late_interaction_rank_gamma must be > 0.")
         if opt.late_interaction_train_score_warmup_epochs < 0:
             raise ValueError("--late_interaction_train_score_warmup_epochs must be >= 0.")
+        if opt.lw_span_joint < 0:
+            raise ValueError("--lw_span_joint must be >= 0.")
+        if opt.span_biaffine_hidden_size <= 0:
+            raise ValueError("--span_biaffine_hidden_size must be > 0.")
+        if opt.span_head_type == "independent_1d":
+            opt.lw_span_joint = 0.0
+
+        if opt.lw_debiased_video_frame_loss < 0:
+            raise ValueError("--lw_debiased_video_frame_loss must be >= 0.")
+        if opt.debiased_video_frame_start_epoch < 0:
+            raise ValueError("--debiased_video_frame_start_epoch must be >= 0.")
+        if opt.debiased_video_frame_temperature <= 0:
+            raise ValueError("--debiased_video_frame_temperature must be > 0.")
+        if opt.debiased_video_frame_gap_temperature <= 0:
+            raise ValueError("--debiased_video_frame_gap_temperature must be > 0.")
+        if not (0.0 <= opt.debiased_video_frame_min_negative_weight <= 1.0):
+            raise ValueError("--debiased_video_frame_min_negative_weight must be in [0, 1].")
+        if opt.debiased_video_frame_background_temperature <= 0:
+            raise ValueError("--debiased_video_frame_background_temperature must be > 0.")
+        if not (0.0 <= opt.debiased_video_frame_background_downweight <= 1.0):
+            raise ValueError("--debiased_video_frame_background_downweight must be in [0, 1].")
+        if not bool(opt.enable_debiased_video_frame_loss):
+            opt.lw_debiased_video_frame_loss = 0.0
+
+        if opt.event_token_compression_keep_ratio <= 0 or opt.event_token_compression_keep_ratio > 1.0:
+            raise ValueError("--event_token_compression_keep_ratio must be in (0, 1].")
+        if opt.event_token_compression_min_tokens < 0:
+            raise ValueError("--event_token_compression_min_tokens must be >= 0.")
+        if opt.event_token_compression_max_tokens < 0:
+            raise ValueError("--event_token_compression_max_tokens must be >= 0.")
+        if opt.event_token_compression_max_tokens > 0 and (
+            opt.event_token_compression_min_tokens > opt.event_token_compression_max_tokens
+        ):
+            raise ValueError("--event_token_compression_min_tokens cannot exceed --event_token_compression_max_tokens.")
+        if opt.event_token_compression_temperature <= 0:
+            raise ValueError("--event_token_compression_temperature must be > 0.")
+
         if opt.multi_vector_query_max_count <= 0:
             raise ValueError("--multi_vector_query_max_count must be > 0.")
         if opt.multi_vector_phrase_window < 0:
@@ -600,6 +681,8 @@ class BaseOptions(object):
             raise ValueError("--vcmr_video_score_weight must be > 0.")
         if opt.score_diagnostics_topk <= 0:
             raise ValueError("--score_diagnostics_topk must be > 0.")
+        if opt.span_infer_pair_chunk_size <= 0:
+            raise ValueError("--span_infer_pair_chunk_size must be > 0.")
         if opt.early_stop_min_delta < 0:
             raise ValueError("--early_stop_min_delta must be >= 0.")
         if opt.early_stop_vcmr_weight < 0 or opt.early_stop_svmr_weight < 0 or opt.early_stop_vr_weight < 0:
