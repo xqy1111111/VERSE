@@ -636,7 +636,8 @@ def start_training():
 if __name__ == '__main__':
     model_dir, eval_split_name, eval_path, debug, build_only = start_training()
     if not debug and not build_only:
-        model_dir = model_dir.split(os.sep)[-1]
+        # Keep absolute run directory so post-train inference can load from any results_root.
+        model_dir = os.path.abspath(model_dir)
         tasks = ["SVMR", "VCMR", "VR"]
         input_args = ["--model_dir", model_dir, "--nms_thd", "0.5", "--eval_split_name", eval_split_name,
                       "--eval_path", eval_path, "--tasks"] + tasks

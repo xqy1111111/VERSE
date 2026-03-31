@@ -40,6 +40,9 @@ htmlcov/
 # Runtime logs / checkpoints / experiment artifacts
 *.log
 logs/
+result
+results
+results/
 method_tvr/results/
 method_act/results/
 outputs/
@@ -61,6 +64,7 @@ method_tvr.bak_20260115_134311/
 
 # Project docs (keep local, do not track)
 docs/
+tmp**
 
 .codex/
 .agents/

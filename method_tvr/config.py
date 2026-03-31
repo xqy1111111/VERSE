@@ -457,8 +457,40 @@ class BaseOptions(object):
             opt.num_workers = 0
             opt.eval_query_bsz = 100
         if isinstance(self, TestOptions):
+            model_dir_input = str(opt.model_dir)
+            method_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.dirname(method_dir)
+            model_dir_candidates = []
 
-            opt.model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results", opt.model_dir)
+            if os.path.isabs(model_dir_input):
+                model_dir_candidates.append(model_dir_input)
+            else:
+                model_dir_candidates.extend(
+                    [
+                        model_dir_input,
+                        os.path.join(os.getcwd(), model_dir_input),
+                        os.path.join(method_dir, "results", model_dir_input),  # legacy default
+                        os.path.join(project_root, "results", model_dir_input),
+                        os.path.join(project_root, "method_tvr", "results", model_dir_input),
+                    ]
+                )
+
+            resolved_model_dir = None
+            tried = []
+            for cand in model_dir_candidates:
+                cand = os.path.abspath(cand)
+                tried.append(cand)
+                if os.path.exists(os.path.join(cand, self.saved_option_filename)):
+                    resolved_model_dir = cand
+                    break
+            if resolved_model_dir is None:
+                raise FileNotFoundError(
+                    "Could not locate model_dir='{}' with {}. Tried:\n{}".format(
+                        model_dir_input, self.saved_option_filename, "\n".join(tried)
+                    )
+                )
+
+            opt.model_dir = resolved_model_dir
             saved_options = load_json(os.path.join(opt.model_dir, self.saved_option_filename))
             for arg in saved_options:
                 if arg not in ["results_root", "num_workers", "nms_thd", "debug",

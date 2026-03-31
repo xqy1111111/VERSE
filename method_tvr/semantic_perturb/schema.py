@@ -1,4 +1,5 @@
 import json
+import re
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 RELATION_HARD_NEGATIVE = "hard_negative"
@@ -55,7 +56,15 @@ def _validate_single_sentence_text(text: str, field_name: str) -> None:
         raise ValueError("{} is too short".format(field_name))
     if stripped.startswith("{") or stripped.startswith("["):
         raise ValueError("{} appears to be JSON, expected natural language".format(field_name))
-    if stripped.count(".") + stripped.count("!") + stripped.count("?") > 3:
+    # Ignore punctuation inside quoted spans so quoted text like "Paris!!!"
+    # does not inflate sentence-boundary heuristics.
+    unquoted = re.sub(r'"[^"\n\r]*"', '""', stripped)
+    unquoted = re.sub(r"“[^”\n\r]*”", "“”", unquoted)
+
+    # Count terminal punctuation groups instead of raw characters so emphatic
+    # tokens like "!!!" do not get treated as multiple sentences.
+    terminal_groups = re.findall(r"[.!?]+", unquoted)
+    if len(terminal_groups) > 3:
         raise ValueError("{} appears to include multiple sentences".format(field_name))
 
 
