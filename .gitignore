@@ -39,6 +39,7 @@ htmlcov/
 
 # Runtime logs / checkpoints / experiment artifacts
 *.log
+nohup.out
 logs/
 result
 results
@@ -49,6 +50,8 @@ outputs/
 cache/
 mlruns/
 mlflow.db
+wandb/
+runs/
 *.ckpt
 *.pth
 *.pt
@@ -67,6 +70,15 @@ docs/
 tmp**
 image/
 image_scripts/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Local machine-specific
+.fonts_local/
+reports/
+tmp_run_summary.tsv
 
 .codex/
 .agents/
